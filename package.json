@@ -16,7 +16,8 @@
     "vscode": "^1.85.0"
   },
   "activationEvents": [
-    "onCommand:moo-capture.connect"
+    "onCommand:moo-capture.connect",
+    "onCommand:moo-capture.setupVirtualDisplay"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -31,6 +32,11 @@
         "command": "moo-capture.disconnect",
         "title": "Disconnect",
         "icon": "$(debug-disconnect)",
+        "category": "Moo Capture"
+      },
+      {
+        "command": "moo-capture.setupVirtualDisplay",
+        "title": "Setup Virtual Display (Headless Mode)",
         "category": "Moo Capture"
       }
     ],
@@ -95,6 +101,21 @@
           "minimum": 1000,
           "maximum": 100000,
           "description": "Stream bitrate in Kbps"
+        },
+        "mooCaptureVscode.headlessMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use a virtual display for headless streaming (game only visible in Cursor)"
+        },
+        "mooCaptureVscode.virtualDisplayResolution": {
+          "type": "string",
+          "default": "1920x1080",
+          "enum": [
+            "1280x720",
+            "1920x1080",
+            "2560x1440"
+          ],
+          "description": "Resolution for the virtual display in headless mode"
         }
       }
     }

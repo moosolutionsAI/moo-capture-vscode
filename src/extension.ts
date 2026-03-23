@@ -1,7 +1,9 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as path from 'path';
 import { COMMANDS, CONFIG_SECTION, STATUS_BAR_PRIORITY, RELAY_DEFAULT_PORT } from './constants';
 import { ConnectionManager } from './connectionManager';
+import { VirtualDisplayManager } from './virtualDisplayManager';
 import type { MooCaptureConfig, ConnectionState } from './types';
 
 // ---------------------------------------------------------------------------
@@ -18,6 +20,8 @@ function getConfig(): MooCaptureConfig {
     fps: cfg.get<number>('fps', 60),
     codec: cfg.get<'h264' | 'hevc'>('codec', 'h264'),
     bitrate: cfg.get<number>('bitrate', 20000),
+    headlessMode: cfg.get<boolean>('headlessMode', true),
+    virtualDisplayResolution: cfg.get<string>('virtualDisplayResolution', '1920x1080'),
   };
 }
 
@@ -30,10 +34,100 @@ const STATE_LABELS: Record<ConnectionState, string> = {
   downloading_relay: '$(sync~spin) Downloading Relay...',
   starting_relay: '$(sync~spin) Starting Relay...',
   pairing: '$(key) Pairing with Sunshine...',
+  setting_up_display: '$(sync~spin) Setting Up Display...',
+  tearing_down_display: '$(sync~spin) Restoring Displays...',
   connecting_webrtc: '$(sync~spin) Connecting...',
   streaming: '$(circle-filled) Streaming',
   error: '$(error) Moo Capture: Error',
 };
+
+// ---------------------------------------------------------------------------
+// Sunshine credential helpers
+// ---------------------------------------------------------------------------
+
+const SUNSHINE_USERNAME_KEY = 'mooCaptureVscode.sunshineUsername';
+const SUNSHINE_PASSWORD_KEY = 'mooCaptureVscode.sunshinePassword';
+
+async function getSunshineCredentials(
+  secrets: vscode.SecretStorage,
+): Promise<{ username: string; password: string } | null> {
+  const username = await secrets.get(SUNSHINE_USERNAME_KEY);
+  const password = await secrets.get(SUNSHINE_PASSWORD_KEY);
+  if (username && password) {
+    return { username, password };
+  }
+  return null;
+}
+
+async function promptAndStoreSunshineCredentials(
+  secrets: vscode.SecretStorage,
+): Promise<{ username: string; password: string } | null> {
+  const username = await vscode.window.showInputBox({
+    prompt: 'Sunshine REST API username',
+    placeHolder: 'admin',
+    value: 'admin',
+  });
+  if (!username) { return null; }
+
+  const password = await vscode.window.showInputBox({
+    prompt: 'Sunshine REST API password',
+    password: true,
+  });
+  if (!password) { return null; }
+
+  await secrets.store(SUNSHINE_USERNAME_KEY, username);
+  await secrets.store(SUNSHINE_PASSWORD_KEY, password);
+
+  return { username, password };
+}
+
+// ---------------------------------------------------------------------------
+// Crash recovery
+// ---------------------------------------------------------------------------
+
+function checkCrashRecovery(globalStoragePath: string, output: vscode.OutputChannel): void {
+  const sentinelPath = path.join(globalStoragePath, 'headless-sentinel.json');
+  if (!fs.existsSync(sentinelPath)) { return; }
+
+  try {
+    const raw = fs.readFileSync(sentinelPath, 'utf-8');
+    const sentinel = JSON.parse(raw);
+    const timestamp = new Date(sentinel.timestamp);
+    const ageMs = Date.now() - timestamp.getTime();
+
+    // Only auto-recover if sentinel is less than 6 hours old
+    const maxAgeMs = 6 * 60 * 60 * 1000;
+    if (ageMs > maxAgeMs) {
+      output.appendLine(`[Recovery] Sentinel is ${Math.round(ageMs / 3600000)}h old — too old, removing.`);
+      fs.unlinkSync(sentinelPath);
+      return;
+    }
+
+    output.appendLine(`[Recovery] Found recent sentinel (${Math.round(ageMs / 60000)}min old). Running teardown...`);
+
+    const teardownScript = sentinel.teardownScript;
+    if (teardownScript && fs.existsSync(teardownScript)) {
+      const { exec } = require('child_process');
+      exec(
+        `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${teardownScript}"`,
+        { timeout: 30000 },
+        (err: any, stdout: string, stderr: string) => {
+          if (err) {
+            output.appendLine(`[Recovery] Teardown failed: ${err.message}`);
+          } else {
+            output.appendLine(`[Recovery] Teardown complete: ${stdout.trim()}`);
+          }
+        },
+      );
+    } else {
+      output.appendLine('[Recovery] Teardown script not found — removing stale sentinel.');
+      fs.unlinkSync(sentinelPath);
+    }
+  } catch (err) {
+    output.appendLine(`[Recovery] Failed to process sentinel: ${err}`);
+    try { fs.unlinkSync(sentinelPath); } catch { /* ignore */ }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Activation
@@ -45,6 +139,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Ensure globalStoragePath exists
   fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
+
+  // Crash recovery: check for leftover sentinel file
+  checkCrashRecovery(context.globalStorageUri.fsPath, output);
 
   const connManager = new ConnectionManager(output, context.globalStorageUri.fsPath);
   let panel: vscode.WebviewPanel | undefined;
@@ -68,6 +165,45 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.connect, async () => {
       const config = getConfig();
+
+      // If headless mode, ensure VDD is installed and credentials are available
+      if (config.headlessMode) {
+        const vdm = new VirtualDisplayManager(output);
+        const installed = await vdm.isVddInstalled();
+
+        if (!installed) {
+          const choice = await vscode.window.showWarningMessage(
+            'Virtual Display Driver is not installed. Headless mode requires it.',
+            'Setup Now',
+            'Continue Without Headless',
+          );
+          if (choice === 'Setup Now') {
+            await vscode.commands.executeCommand('moo-capture.setupVirtualDisplay');
+            // Re-check after setup
+            const nowInstalled = await vdm.isVddInstalled();
+            if (!nowInstalled) {
+              vscode.window.showErrorMessage('VDD installation did not succeed. Continuing without headless mode.');
+              config.headlessMode = false;
+            }
+          } else {
+            config.headlessMode = false;
+          }
+        }
+
+        // Get Sunshine credentials for REST API
+        if (config.headlessMode) {
+          let creds = await getSunshineCredentials(context.secrets);
+          if (!creds) {
+            creds = await promptAndStoreSunshineCredentials(context.secrets);
+          }
+          if (creds) {
+            connManager.sunshineUsername = creds.username;
+            connManager.sunshinePassword = creds.password;
+          } else {
+            output.appendLine('[Connect] No Sunshine credentials — headless prep-cmd will not be auto-configured.');
+          }
+        }
+      }
 
       // Create panel if it doesn't exist
       if (!panel) {
@@ -94,7 +230,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       try {
-        const streamUrl = await connManager.connect(config, (pin: string) => {
+        const { port, hostId, apps } = await connManager.connect(config, (pin: string) => {
           vscode.window.showInformationMessage(
             `Enter this PIN in Sunshine: ${pin}`,
             { modal: true },
@@ -102,7 +238,25 @@ export function activate(context: vscode.ExtensionContext): void {
           );
         });
 
-        // Load stream page directly in iframe — skips app selection
+        if (apps.length === 0) {
+          panel.webview.html = getErrorHtml('No apps found in Sunshine. Add apps at https://localhost:47990/applications');
+          return;
+        }
+
+        // Let user pick which app to stream
+        let selectedApp = apps[0];
+        if (apps.length > 1) {
+          const pick = await vscode.window.showQuickPick(
+            apps.map(a => ({ label: a.name, appId: a.id })),
+            { placeHolder: 'Select an app to stream' },
+          );
+          if (!pick) { return; } // User cancelled
+          selectedApp = { id: pick.appId, name: pick.label };
+        }
+
+        // Load stream.html directly with the selected app
+        const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${selectedApp.id}`;
+        output.appendLine(`[Connect] Streaming ${selectedApp.name}: ${streamUrl}`);
         panel.webview.html = getWebviewContent(streamUrl);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -123,6 +277,56 @@ export function activate(context: vscode.ExtensionContext): void {
         panel = undefined;
         statusBar.text = STATE_LABELS.disconnected;
       }
+    }),
+  );
+
+  // Setup Virtual Display command
+  context.subscriptions.push(
+    vscode.commands.registerCommand('moo-capture.setupVirtualDisplay', async () => {
+      const vdm = new VirtualDisplayManager(output);
+
+      // Check if already installed
+      const alreadyInstalled = await vdm.isVddInstalled();
+      if (alreadyInstalled) {
+        vscode.window.showInformationMessage('Virtual Display Driver is already installed.');
+        return;
+      }
+
+      // Download and install with progress
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Moo Capture: Setting up Virtual Display',
+          cancellable: false,
+        },
+        async (progress) => {
+          try {
+            progress.report({ message: 'Downloading VDD installer...' });
+            const installerPath = await vdm.downloadVddInstaller(
+              context.globalStorageUri.fsPath,
+              (msg) => progress.report({ message: msg }),
+            );
+
+            progress.report({ message: 'Running installer (UAC prompt expected)...' });
+            await vdm.installVdd(installerPath);
+
+            progress.report({ message: 'Verifying installation...' });
+            const verified = await vdm.verifyVddInstalled();
+
+            if (verified) {
+              vscode.window.showInformationMessage('Virtual Display Driver installed successfully.');
+            } else {
+              vscode.window.showWarningMessage(
+                'VDD installer ran but the device was not detected. You may need to restart your PC.',
+              );
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            output.appendLine(`[VDD Setup] Error: ${msg}`);
+            vscode.window.showErrorMessage(`Failed to set up Virtual Display Driver: ${msg}`);
+          }
+        },
+      );
     }),
   );
 

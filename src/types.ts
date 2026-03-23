@@ -10,6 +10,8 @@ export interface MooCaptureConfig {
   fps: number;
   codec: 'h264' | 'hevc';
   bitrate: number;
+  headlessMode: boolean;
+  virtualDisplayResolution: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +41,8 @@ export type ConnectionState =
   | 'downloading_relay'
   | 'starting_relay'
   | 'pairing'
+  | 'setting_up_display'
+  | 'tearing_down_display'
   | 'connecting_webrtc'
   | 'streaming'
   | 'error';
@@ -84,4 +88,15 @@ export interface StreamConfig {
   fps: number;
   codec: 'h264' | 'hevc';
   bitrate: number;
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Display
+// ---------------------------------------------------------------------------
+
+export interface DisplayInfo {
+  name: string;
+  resolution: string;
+  attached: boolean;
+  adapter: string;
 }

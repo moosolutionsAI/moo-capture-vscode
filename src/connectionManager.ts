@@ -1,11 +1,21 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import type { OutputChannel } from 'vscode';
 import { RelayManager } from './relayManager';
 import { RelayDownloader } from './relayDownloader';
 import { RelayApiClient } from './relayApiClient';
+import { VirtualDisplayManager } from './virtualDisplayManager';
+import { SunshineConfigManager } from './sunshineConfigManager';
+import {
+  generateSetupScript,
+  generateTeardownScript,
+  generateWatchdogScript,
+} from './displayScripts';
 import {
   RELAY_DEFAULT_PORT,
   RELAY_INTERNAL_USER,
   RELAY_INTERNAL_PASS,
+  SUNSHINE_DXGI_INFO,
 } from './constants';
 import type { ConnectionState, MooCaptureConfig, RelayHost } from './types';
 
@@ -14,7 +24,15 @@ export class ConnectionManager {
   private readonly relay: RelayManager;
   private readonly downloader: RelayDownloader;
   private apiClient: RelayApiClient | null = null;
+  private lastHostId: number | null = null;
   private onStateChange?: (state: ConnectionState, message?: string) => void;
+
+  private vdm: VirtualDisplayManager | null = null;
+  private sunshineConfig: SunshineConfigManager | null = null;
+
+  /** Sunshine REST API credentials (set externally before connect if headless). */
+  sunshineUsername: string = '';
+  sunshinePassword: string = '';
 
   constructor(
     private readonly output: OutputChannel,
@@ -40,7 +58,7 @@ export class ConnectionManager {
   async connect(
     config: MooCaptureConfig,
     onNeedPairPin: (pin: string) => void,
-  ): Promise<string> {
+  ): Promise<{ port: number; hostId: number; apps: import('./types').RelayApp[] }> {
     try {
       const port = config.relayPort || RELAY_DEFAULT_PORT;
 
@@ -69,17 +87,113 @@ export class ConnectionManager {
       // Step 4: Ensure host is added AND paired
       const host = await this.ensureHostPaired(config, onNeedPairPin);
 
-      // Step 5: Return relay URL — show app selection (Desktop, Steam, etc.)
+      // Step 4.5: Headless virtual display setup (non-blocking on failure)
+      if (config.headlessMode) {
+        try {
+          await this.setupHeadlessDisplay(config);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.output.appendLine(`[Connect] Headless display setup failed (falling back to normal): ${msg}`);
+        }
+      }
+
+      // Step 5: Get apps list
+      this.lastHostId = host.host_id;
+      const apps = await this.apiClient.listApps(host.host_id);
+      this.output.appendLine(`[Connect] Apps: ${apps.map(a => a.name).join(', ')}`);
+
       this.setState('streaming', 'Connected');
-      const relayUrl = `http://127.0.0.1:${port}`;
-      this.output.appendLine(`[Connect] Relay URL: ${relayUrl}`);
-      return relayUrl;
+      return { port, hostId: host.host_id, apps };
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[Connect] Error: ${msg}`);
       this.setState('error', msg);
       throw err;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Headless virtual display setup
+  // -------------------------------------------------------------------------
+
+  private async setupHeadlessDisplay(config: MooCaptureConfig): Promise<void> {
+    this.setState('setting_up_display', 'Setting up virtual display...');
+
+    this.vdm = new VirtualDisplayManager(this.output);
+    this.sunshineConfig = new SunshineConfigManager(this.output);
+
+    // Check if VDD is installed
+    const installed = await this.vdm.isVddInstalled();
+    if (!installed) {
+      this.output.appendLine('[Connect] VDD not installed — skipping headless setup.');
+      throw new Error('Virtual Display Driver is not installed. Run "Moo Capture: Setup Virtual Display" first.');
+    }
+
+    // Write scripts to globalStoragePath/scripts/
+    const scriptsDir = path.join(this.globalStoragePath, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+
+    const sentinelPath = path.join(this.globalStoragePath, 'headless-sentinel.json');
+    const setupScriptPath = path.join(scriptsDir, 'setup.ps1');
+    const teardownScriptPath = path.join(scriptsDir, 'teardown.ps1');
+    const watchdogScriptPath = path.join(scriptsDir, 'watchdog.ps1');
+
+    const setupScript = generateSetupScript({
+      dxgiInfoPath: SUNSHINE_DXGI_INFO,
+      sentinelPath,
+      watchdogScriptPath,
+      teardownScriptPath,
+    });
+
+    const teardownScript = generateTeardownScript({
+      sentinelPath,
+    });
+
+    const watchdogScript = generateWatchdogScript({
+      sentinelPath,
+      teardownScriptPath,
+    });
+
+    fs.writeFileSync(setupScriptPath, setupScript, 'utf-8');
+    fs.writeFileSync(teardownScriptPath, teardownScript, 'utf-8');
+    fs.writeFileSync(watchdogScriptPath, watchdogScript, 'utf-8');
+
+    this.output.appendLine(`[Connect] Display scripts written to ${scriptsDir}`);
+
+    // Update Sunshine apps via REST API if credentials are available
+    if (this.sunshineUsername && this.sunshinePassword) {
+      try {
+        const apps = await this.sunshineConfig.getSunshineApps(
+          this.sunshineUsername,
+          this.sunshinePassword,
+        );
+
+        this.output.appendLine(`[Connect] Found ${apps.length} Sunshine app(s). Adding prep commands...`);
+
+        // Use the virtual display resolution from config, or a default name
+        const virtualDisplayName = '';  // Will be determined at runtime by the setup script
+        const updatedApps = this.sunshineConfig.addPrepCommandsToApps(
+          apps,
+          setupScriptPath,
+          teardownScriptPath,
+          virtualDisplayName,
+        );
+
+        await this.sunshineConfig.updateSunshineApps(
+          this.sunshineUsername,
+          this.sunshinePassword,
+          updatedApps,
+        );
+
+        this.output.appendLine('[Connect] Sunshine apps updated with headless prep commands.');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`[Connect] Failed to update Sunshine apps: ${msg}`);
+        // Non-fatal — the scripts are written, user can configure manually
+      }
+    } else {
+      this.output.appendLine('[Connect] No Sunshine credentials — scripts written but apps not auto-configured.');
     }
   }
 
@@ -125,10 +239,29 @@ export class ConnectionManager {
   }
 
   disconnect(): void {
+    // Cancel the active stream on the host so streamer.exe stops
+    if (this.apiClient && this.lastHostId) {
+      this.apiClient.cancelStream(this.lastHostId).catch(() => {});
+      this.output.appendLine(`[Disconnect] Cancelled stream on host ${this.lastHostId}`);
+    }
+
+    // Verify displays were restored if headless was active
+    if (this.vdm) {
+      this.setState('tearing_down_display', 'Restoring displays...');
+      const sentinelPath = path.join(this.globalStoragePath, 'headless-sentinel.json');
+      if (fs.existsSync(sentinelPath)) {
+        this.output.appendLine('[Disconnect] Sentinel file still exists — teardown script should handle cleanup.');
+        // The teardown is handled by Sunshine's prep-cmd undo, but log for awareness
+      }
+      this.vdm = null;
+      this.sunshineConfig = null;
+    }
+
     this.setState('disconnected');
   }
 
   dispose(): void {
+    this.disconnect();
     this.relay.stop();
   }
 

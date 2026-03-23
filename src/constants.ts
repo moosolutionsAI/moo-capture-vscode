@@ -44,8 +44,20 @@ export const EXTENSION_ID = 'moo-capture';
 export const COMMANDS = {
   connect: 'moo-capture.connect',
   disconnect: 'moo-capture.disconnect',
+  setupVirtualDisplay: 'moo-capture.setupVirtualDisplay',
 } as const;
 
 export const CONFIG_SECTION = 'mooCaptureVscode';
 
 export const STATUS_BAR_PRIORITY = 50;
+
+// ---------------------------------------------------------------------------
+// Virtual Display Driver (VDD)
+// ---------------------------------------------------------------------------
+
+export const VDD_GITHUB_REPO = 'VirtualDrivers/Virtual-Display-Driver';
+export const VDD_DEVICE_NAME = 'Virtual Display Driver';
+export const SUNSHINE_INSTALL_DIR = 'C:\\Program Files\\Sunshine';
+export const SUNSHINE_DXGI_INFO = 'C:\\Program Files\\Sunshine\\tools\\dxgi-info.exe';
+export const SUNSHINE_API_PORT = 47990;
+export const EMERGENCY_HOTKEY = 'Ctrl+Alt+Shift+R';
