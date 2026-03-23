@@ -1,0 +1,13 @@
+.vscode/
+.claude/
+src/
+webview-ui/
+node_modules/
+.relay/
+*.ts
+!*.d.ts
+tsconfig.json
+esbuild.js
+.gitignore
+.git/
+*.vsix

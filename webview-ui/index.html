@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Moo Capture</title>
+  <link rel="stylesheet" href="./src/styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Connection UI -->
+    <div id="connect-screen">
+      <div class="connect-card">
+        <h1>Moo Capture</h1>
+        <p class="subtitle">Low-latency game streaming</p>
+        <button id="btn-connect" type="button">Connect</button>
+        <p id="connect-status" class="status"></p>
+      </div>
+    </div>
+
+    <!-- Streaming canvas -->
+    <canvas id="stream-canvas"></canvas>
+    <video id="stream-video" autoplay playsinline muted></video>
+
+    <!-- HUD overlay (toggled with Tab) -->
+    <div id="hud" class="hidden">
+      <div class="hud-row"><span class="hud-label">FPS</span><span id="hud-fps">—</span></div>
+      <div class="hud-row"><span class="hud-label">Decode</span><span id="hud-decode">—</span></div>
+      <div class="hud-row"><span class="hud-label">Latency</span><span id="hud-latency">—</span></div>
+      <div class="hud-row"><span class="hud-label">Gamepad</span><span id="hud-gamepad">—</span></div>
+      <button id="btn-disconnect" type="button">Disconnect</button>
+    </div>
+  </div>
+  <script type="module" src="./src/main.ts"></script>
+</body>
+</html>

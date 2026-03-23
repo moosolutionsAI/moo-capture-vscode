@@ -1,0 +1,120 @@
+{
+  "name": "moo-capture",
+  "displayName": "Moo Capture",
+  "description": "Low-latency game streaming client for VS Code — connects to Sunshine for GPU-accelerated screen capture",
+  "version": "0.1.0",
+  "publisher": "MooKeyboardAI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MooKeyboardAI/moo-capture-vscode"
+  },
+  "categories": [
+    "Other"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "activationEvents": [
+    "onCommand:moo-capture.connect"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "moo-capture.connect",
+        "title": "Connect to Sunshine",
+        "icon": "$(game)",
+        "category": "Moo Capture"
+      },
+      {
+        "command": "moo-capture.disconnect",
+        "title": "Disconnect",
+        "icon": "$(debug-disconnect)",
+        "category": "Moo Capture"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "moo-capture.connect",
+        "key": "ctrl+shift+g",
+        "mac": "cmd+shift+g"
+      }
+    ],
+    "configuration": {
+      "title": "Moo Capture",
+      "properties": {
+        "mooCaptureVscode.sunshineHost": {
+          "type": "string",
+          "default": "localhost",
+          "description": "Sunshine server hostname or IP address"
+        },
+        "mooCaptureVscode.sunshinePort": {
+          "type": "number",
+          "default": 47989,
+          "description": "Sunshine HTTP API port (default: 47989)"
+        },
+        "mooCaptureVscode.relayPort": {
+          "type": "number",
+          "default": 48080,
+          "description": "Local port for the streaming relay (auto-managed)"
+        },
+        "mooCaptureVscode.resolution": {
+          "type": "string",
+          "default": "1920x1080",
+          "enum": [
+            "1280x720",
+            "1920x1080",
+            "2560x1440",
+            "3840x2160"
+          ],
+          "description": "Stream resolution"
+        },
+        "mooCaptureVscode.fps": {
+          "type": "number",
+          "default": 60,
+          "enum": [
+            30,
+            60,
+            120
+          ],
+          "description": "Target frames per second"
+        },
+        "mooCaptureVscode.codec": {
+          "type": "string",
+          "default": "h264",
+          "enum": [
+            "h264",
+            "hevc"
+          ],
+          "description": "Video codec (H.264 recommended for lowest latency)"
+        },
+        "mooCaptureVscode.bitrate": {
+          "type": "number",
+          "default": 20000,
+          "minimum": 1000,
+          "maximum": 100000,
+          "description": "Stream bitrate in Kbps"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "build:ext": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "vsce package",
+    "lint": "eslint src/"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.18.1",
+    "@vscode/vsce": "^2.24.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}
