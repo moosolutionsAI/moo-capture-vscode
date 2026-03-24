@@ -1,14 +1,15 @@
 // ---------------------------------------------------------------------------
-// Sunshine REST API configuration manager
+// Vibeshine REST API configuration manager
+// (Vibeshine is a Sunshine fork — same REST API, same port)
 // ---------------------------------------------------------------------------
 
 import * as https from 'https';
 import type { OutputChannel } from 'vscode';
-import { SUNSHINE_API_PORT } from './constants';
+import { VIBESHINE_API_PORT } from './constants';
 
 /**
- * Manages interaction with Sunshine's REST API for reading and updating
- * application configuration (apps.json).
+ * Manages interaction with Vibeshine's REST API for reading and updating
+ * application configuration (apps.json). API-compatible with Sunshine.
  */
 export class SunshineConfigManager {
   constructor(private readonly output: OutputChannel) {}
@@ -20,7 +21,7 @@ export class SunshineConfigManager {
   /**
    * Fetches the list of configured Sunshine apps via the REST API.
    *
-   * GET https://localhost:47990/api/apps
+   * GET https://localhost:47990/api/apps (Vibeshine REST API)
    *
    * @returns Array of app objects from the Sunshine configuration.
    */
@@ -34,7 +35,7 @@ export class SunshineConfigManager {
   /**
    * Writes the full apps array back to Sunshine via the REST API.
    *
-   * POST https://localhost:47990/api/apps
+   * POST https://localhost:47990/api/apps (Vibeshine REST API)
    */
   async updateSunshineApps(
     username: string,
@@ -43,7 +44,7 @@ export class SunshineConfigManager {
   ): Promise<void> {
     const body = JSON.stringify({ env: {}, apps });
     await this.apiRequest('POST', '/api/apps', username, password, body);
-    this.output.appendLine('[SunshineConfig] Apps updated successfully.');
+    this.output.appendLine('[VibeshineConfig] Apps updated successfully.');
   }
 
   /**
@@ -114,7 +115,7 @@ export class SunshineConfigManager {
 
       const options: https.RequestOptions = {
         hostname: 'localhost',
-        port: SUNSHINE_API_PORT,
+        port: VIBESHINE_API_PORT,
         path,
         method,
         rejectUnauthorized: false, // Sunshine uses a self-signed cert
@@ -139,14 +140,14 @@ export class SunshineConfigManager {
             resolve(data);
           } else {
             const msg = `Sunshine API ${method} ${path} returned ${res.statusCode}: ${data}`;
-            this.output.appendLine(`[SunshineConfig] ${msg}`);
+            this.output.appendLine(`[VibeshineConfig] ${msg}`);
             reject(new Error(msg));
           }
         });
       });
 
       req.on('error', (err) => {
-        this.output.appendLine(`[SunshineConfig] Request error: ${err.message}`);
+        this.output.appendLine(`[VibeshineConfig] Request error: ${err.message}`);
         reject(err);
       });
 

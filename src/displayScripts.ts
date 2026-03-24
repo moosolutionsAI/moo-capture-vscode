@@ -6,7 +6,7 @@
 // calling code is responsible for writing them to disk and executing them.
 // ---------------------------------------------------------------------------
 
-import { EMERGENCY_HOTKEY } from './constants';
+import { EMERGENCY_HOTKEY, STREAMER_PROCESS_NAME } from './constants';
 
 // ---------------------------------------------------------------------------
 // Types for script options
@@ -272,7 +272,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 # ---------- Constants ----------
 $MaxLifetimeSeconds = 4 * 60 * 60  # 4 hours
-$StreamerProcessName = 'sunshine'
+$StreamerProcessName = '${STREAMER_PROCESS_NAME}'
 $PollIntervalSeconds = 5
 $GracePeriodSeconds  = 10
 

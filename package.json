@@ -1,7 +1,7 @@
 {
   "name": "moo-capture",
   "displayName": "Moo Capture",
-  "description": "Low-latency game streaming client for VS Code — connects to Sunshine for GPU-accelerated screen capture",
+  "description": "Low-latency game streaming client for VS Code — connects to Vibeshine for GPU-accelerated screen capture",
   "version": "0.1.0",
   "publisher": "MooKeyboardAI",
   "license": "MIT",
@@ -24,7 +24,7 @@
     "commands": [
       {
         "command": "moo-capture.connect",
-        "title": "Connect to Sunshine",
+        "title": "Connect to Vibeshine",
         "icon": "$(game)",
         "category": "Moo Capture"
       },
@@ -52,13 +52,13 @@
       "properties": {
         "mooCaptureVscode.sunshineHost": {
           "type": "string",
-          "default": "localhost",
-          "description": "Sunshine server hostname or IP address"
+          "default": "127.0.0.1",
+          "description": "Vibeshine server hostname or IP address"
         },
         "mooCaptureVscode.sunshinePort": {
           "type": "number",
           "default": 47989,
-          "description": "Sunshine HTTP API port (default: 47989)"
+          "description": "Vibeshine HTTP API port (default: 47989)"
         },
         "mooCaptureVscode.relayPort": {
           "type": "number",

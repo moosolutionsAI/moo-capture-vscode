@@ -31,15 +31,9 @@ export class RelayManager {
       return;
     }
 
-    // Check if relay is already running from a previous session (e.g., after Cursor reload)
-    const alreadyUp = await this.isHealthy(port);
-    if (alreadyUp) {
-      this.output.appendLine('[Relay] Already running on port (from previous session), reusing');
-      // Update config in case it's stale
-      this.writeConfig(dataDir, port);
-      this.lastBinaryPath = binaryPath;
-      return;
-    }
+    // Kill any stale relay processes from previous sessions so we always
+    // start fresh (avoids zombie relays that can't reach Vibeshine)
+    await this.killStaleRelayProcesses(binaryPath);
 
     this.stopping = false;
     this.retryCount = 0;
@@ -49,6 +43,24 @@ export class RelayManager {
     this.writeConfig(dataDir, port);
 
     await this.spawnRelay(binaryPath, port, dataDir);
+  }
+
+  /** Kill any orphaned web-server.exe processes from previous sessions. */
+  private killStaleRelayProcesses(binaryPath: string): Promise<void> {
+    return new Promise((resolve) => {
+      const { exec } = require('child_process') as typeof import('child_process');
+      const binaryName = path.basename(binaryPath, '.exe');
+      exec(
+        `powershell -NoProfile -Command "Get-Process -Name '${binaryName}' -ErrorAction SilentlyContinue | Stop-Process -Force"`,
+        { timeout: 5000 },
+        (err) => {
+          if (!err) {
+            this.output.appendLine('[Relay] Killed stale relay processes');
+          }
+          resolve();
+        },
+      );
+    });
   }
 
   private writeConfig(dataDir: string, port: number): void {

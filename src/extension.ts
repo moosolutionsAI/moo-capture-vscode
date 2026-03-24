@@ -13,8 +13,8 @@ import type { MooCaptureConfig, ConnectionState } from './types';
 function getConfig(): MooCaptureConfig {
   const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
   return {
-    sunshineHost: cfg.get<string>('sunshineHost', 'localhost'),
-    sunshinePort: cfg.get<number>('sunshinePort', 47984),
+    sunshineHost: cfg.get<string>('sunshineHost', '127.0.0.1'),
+    sunshinePort: cfg.get<number>('sunshinePort', 47989),
     relayPort: cfg.get<number>('relayPort', RELAY_DEFAULT_PORT),
     resolution: cfg.get<string>('resolution', '1920x1080'),
     fps: cfg.get<number>('fps', 60),
@@ -33,7 +33,7 @@ const STATE_LABELS: Record<ConnectionState, string> = {
   disconnected: '$(game) Moo Capture',
   downloading_relay: '$(sync~spin) Downloading Relay...',
   starting_relay: '$(sync~spin) Starting Relay...',
-  pairing: '$(key) Pairing with Sunshine...',
+  pairing: '$(key) Pairing with Vibeshine...',
   setting_up_display: '$(sync~spin) Setting Up Display...',
   tearing_down_display: '$(sync~spin) Restoring Displays...',
   connecting_webrtc: '$(sync~spin) Connecting...',
@@ -42,41 +42,41 @@ const STATE_LABELS: Record<ConnectionState, string> = {
 };
 
 // ---------------------------------------------------------------------------
-// Sunshine credential helpers
+// Vibeshine credential helpers
 // ---------------------------------------------------------------------------
 
-const SUNSHINE_USERNAME_KEY = 'mooCaptureVscode.sunshineUsername';
-const SUNSHINE_PASSWORD_KEY = 'mooCaptureVscode.sunshinePassword';
+const VIBESHINE_USERNAME_KEY = 'mooCaptureVscode.vibeshineUsername';
+const VIBESHINE_PASSWORD_KEY = 'mooCaptureVscode.vibeshinePassword';
 
-async function getSunshineCredentials(
+async function getVibeshineCredentials(
   secrets: vscode.SecretStorage,
 ): Promise<{ username: string; password: string } | null> {
-  const username = await secrets.get(SUNSHINE_USERNAME_KEY);
-  const password = await secrets.get(SUNSHINE_PASSWORD_KEY);
+  const username = await secrets.get(VIBESHINE_USERNAME_KEY);
+  const password = await secrets.get(VIBESHINE_PASSWORD_KEY);
   if (username && password) {
     return { username, password };
   }
   return null;
 }
 
-async function promptAndStoreSunshineCredentials(
+async function promptAndStoreVibeshineCredentials(
   secrets: vscode.SecretStorage,
 ): Promise<{ username: string; password: string } | null> {
   const username = await vscode.window.showInputBox({
-    prompt: 'Sunshine REST API username',
+    prompt: 'Vibeshine REST API username',
     placeHolder: 'admin',
     value: 'admin',
   });
   if (!username) { return null; }
 
   const password = await vscode.window.showInputBox({
-    prompt: 'Sunshine REST API password',
+    prompt: 'Vibeshine REST API password',
     password: true,
   });
   if (!password) { return null; }
 
-  await secrets.store(SUNSHINE_USERNAME_KEY, username);
-  await secrets.store(SUNSHINE_PASSWORD_KEY, password);
+  await secrets.store(VIBESHINE_USERNAME_KEY, username);
+  await secrets.store(VIBESHINE_PASSWORD_KEY, password);
 
   return { username, password };
 }
@@ -150,7 +150,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY);
   statusBar.command = COMMANDS.connect;
   statusBar.text = STATE_LABELS.disconnected;
-  statusBar.tooltip = 'Click to connect to Sunshine';
+  statusBar.tooltip = 'Click to connect to Vibeshine';
   statusBar.show();
   context.subscriptions.push(statusBar);
 
@@ -190,17 +190,17 @@ export function activate(context: vscode.ExtensionContext): void {
           }
         }
 
-        // Get Sunshine credentials for REST API
+        // Get Vibeshine credentials for REST API
         if (config.headlessMode) {
-          let creds = await getSunshineCredentials(context.secrets);
+          let creds = await getVibeshineCredentials(context.secrets);
           if (!creds) {
-            creds = await promptAndStoreSunshineCredentials(context.secrets);
+            creds = await promptAndStoreVibeshineCredentials(context.secrets);
           }
           if (creds) {
-            connManager.sunshineUsername = creds.username;
-            connManager.sunshinePassword = creds.password;
+            connManager.vibeshineUsername = creds.username;
+            connManager.vibeshinePassword = creds.password;
           } else {
-            output.appendLine('[Connect] No Sunshine credentials — headless prep-cmd will not be auto-configured.');
+            output.appendLine('[Connect] No Vibeshine credentials — headless prep-cmd will not be auto-configured.');
           }
         }
       }
@@ -232,14 +232,14 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const { port, hostId, apps } = await connManager.connect(config, (pin: string) => {
           vscode.window.showInformationMessage(
-            `Enter this PIN in Sunshine: ${pin}`,
+            `Enter this PIN in Vibeshine: ${pin}`,
             { modal: true },
             'Done',
           );
         });
 
         if (apps.length === 0) {
-          panel.webview.html = getErrorHtml('No apps found in Sunshine. Add apps at https://localhost:47990/applications');
+          panel.webview.html = getErrorHtml('No apps found in Vibeshine. Add apps at https://localhost:47990/applications');
           return;
         }
 

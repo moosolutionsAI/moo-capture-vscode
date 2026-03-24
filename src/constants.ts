@@ -1,18 +1,18 @@
 // ---------------------------------------------------------------------------
-// Sunshine / NVHTTP
+// Vibeshine (Sunshine-fork) / NVHTTP
 // ---------------------------------------------------------------------------
 
-export const SUNSHINE_DEFAULT_HOST = 'localhost';
-export const SUNSHINE_HTTPS_PORT = 47984;
-export const SUNSHINE_WEB_PORT = 47990;
-export const SUNSHINE_HTTP_PORT = 47989;
-export const SUNSHINE_RTSP_PORT = 48010;
-export const SUNSHINE_VIDEO_RTP_PORT = 47998;
-export const SUNSHINE_CONTROL_PORT = 47999;
-export const SUNSHINE_AUDIO_PORT = 48000;
+export const VIBESHINE_DEFAULT_HOST = 'localhost';
+export const VIBESHINE_HTTPS_PORT = 47984;
+export const VIBESHINE_WEB_PORT = 47990;
+export const VIBESHINE_HTTP_PORT = 47989;
+export const VIBESHINE_RTSP_PORT = 48010;
+export const VIBESHINE_VIDEO_RTP_PORT = 47998;
+export const VIBESHINE_CONTROL_PORT = 47999;
+export const VIBESHINE_AUDIO_PORT = 48000;
 
 /** Timeout for NVHTTP API requests (ms) */
-export const SUNSHINE_REQUEST_TIMEOUT_MS = 5000;
+export const VIBESHINE_REQUEST_TIMEOUT_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // Relay (moonlight-web-stream)
@@ -57,7 +57,10 @@ export const STATUS_BAR_PRIORITY = 50;
 
 export const VDD_GITHUB_REPO = 'VirtualDrivers/Virtual-Display-Driver';
 export const VDD_DEVICE_NAME = 'Virtual Display Driver';
-export const SUNSHINE_INSTALL_DIR = 'C:\\Program Files\\Sunshine';
-export const SUNSHINE_DXGI_INFO = 'C:\\Program Files\\Sunshine\\tools\\dxgi-info.exe';
-export const SUNSHINE_API_PORT = 47990;
+/** Vibeshine installs to the Sunshine directory for backward compatibility */
+export const VIBESHINE_INSTALL_DIR = 'C:\\Program Files\\Sunshine';
+export const VIBESHINE_DXGI_INFO = 'C:\\Program Files\\Sunshine\\tools\\dxgi-info.exe';
+export const VIBESHINE_API_PORT = 47990;
+/** Process name that the watchdog monitors (Vibeshine keeps 'sunshine' for compat) */
+export const STREAMER_PROCESS_NAME = 'sunshine';
 export const EMERGENCY_HOTKEY = 'Ctrl+Alt+Shift+R';

@@ -15,7 +15,7 @@ import {
   RELAY_DEFAULT_PORT,
   RELAY_INTERNAL_USER,
   RELAY_INTERNAL_PASS,
-  SUNSHINE_DXGI_INFO,
+  VIBESHINE_DXGI_INFO,
 } from './constants';
 import type { ConnectionState, MooCaptureConfig, RelayHost } from './types';
 
@@ -30,9 +30,9 @@ export class ConnectionManager {
   private vdm: VirtualDisplayManager | null = null;
   private sunshineConfig: SunshineConfigManager | null = null;
 
-  /** Sunshine REST API credentials (set externally before connect if headless). */
-  sunshineUsername: string = '';
-  sunshinePassword: string = '';
+  /** Vibeshine REST API credentials (set externally before connect if headless). */
+  vibeshineUsername: string = '';
+  vibeshinePassword: string = '';
 
   constructor(
     private readonly output: OutputChannel,
@@ -140,7 +140,7 @@ export class ConnectionManager {
     const watchdogScriptPath = path.join(scriptsDir, 'watchdog.ps1');
 
     const setupScript = generateSetupScript({
-      dxgiInfoPath: SUNSHINE_DXGI_INFO,
+      dxgiInfoPath: VIBESHINE_DXGI_INFO,
       sentinelPath,
       watchdogScriptPath,
       teardownScriptPath,
@@ -161,15 +161,15 @@ export class ConnectionManager {
 
     this.output.appendLine(`[Connect] Display scripts written to ${scriptsDir}`);
 
-    // Update Sunshine apps via REST API if credentials are available
-    if (this.sunshineUsername && this.sunshinePassword) {
+    // Update Vibeshine apps via REST API if credentials are available
+    if (this.vibeshineUsername && this.vibeshinePassword) {
       try {
         const apps = await this.sunshineConfig.getSunshineApps(
-          this.sunshineUsername,
-          this.sunshinePassword,
+          this.vibeshineUsername,
+          this.vibeshinePassword,
         );
 
-        this.output.appendLine(`[Connect] Found ${apps.length} Sunshine app(s). Adding prep commands...`);
+        this.output.appendLine(`[Connect] Found ${apps.length} Vibeshine app(s). Adding prep commands...`);
 
         // Use the virtual display resolution from config, or a default name
         const virtualDisplayName = '';  // Will be determined at runtime by the setup script
@@ -181,19 +181,19 @@ export class ConnectionManager {
         );
 
         await this.sunshineConfig.updateSunshineApps(
-          this.sunshineUsername,
-          this.sunshinePassword,
+          this.vibeshineUsername,
+          this.vibeshinePassword,
           updatedApps,
         );
 
-        this.output.appendLine('[Connect] Sunshine apps updated with headless prep commands.');
+        this.output.appendLine('[Connect] Vibeshine apps updated with headless prep commands.');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        this.output.appendLine(`[Connect] Failed to update Sunshine apps: ${msg}`);
+        this.output.appendLine(`[Connect] Failed to update Vibeshine apps: ${msg}`);
         // Non-fatal — the scripts are written, user can configure manually
       }
     } else {
-      this.output.appendLine('[Connect] No Sunshine credentials — scripts written but apps not auto-configured.');
+      this.output.appendLine('[Connect] No Vibeshine credentials — scripts written but apps not auto-configured.');
     }
   }
 
@@ -214,15 +214,30 @@ export class ConnectionManager {
     let host = hosts.length > 0 ? hosts[0] : null;
 
     if (!host) {
-      // No hosts at all — add one
+      // No hosts at all — add one (retry up to 3 times; Vibeshine may drop
+      // the first connection before the response is fully read)
       this.output.appendLine(`[Connect] Adding host: ${config.sunshineHost}:${config.sunshinePort}`);
-      host = await this.apiClient.addHost(config.sunshineHost, config.sunshinePort);
-      this.output.appendLine(`[Connect] Host added: ${host.name} (id=${host.host_id}, paired=${host.paired})`);
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          host = await this.apiClient.addHost(config.sunshineHost, config.sunshinePort);
+          this.output.appendLine(`[Connect] Host added: ${host.name} (id=${host.host_id}, paired=${host.paired})`);
+          break;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (attempt < 3 && msg.includes('IncompleteMessage')) {
+            this.output.appendLine(`[Connect] addHost attempt ${attempt} failed (IncompleteMessage), retrying in 1s...`);
+            await new Promise(r => setTimeout(r, 1000));
+          } else {
+            throw err;
+          }
+        }
+      }
+      if (!host) { throw new Error('Failed to add host after 3 attempts'); }
     }
 
     // Pair if needed
     if (host.paired === 'NotPaired') {
-      this.setState('pairing', 'Pairing with Sunshine — check for PIN prompt...');
+      this.setState('pairing', 'Pairing with Vibeshine — check for PIN prompt...');
       this.output.appendLine(`[Connect] Host ${host.host_id} not paired, starting pairing...`);
 
       host = await this.apiClient.pair(host.host_id, (pin) => {
