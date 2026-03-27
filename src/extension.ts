@@ -130,6 +130,36 @@ function checkCrashRecovery(globalStoragePath: string, output: vscode.OutputChan
 }
 
 // ---------------------------------------------------------------------------
+// Pre-flight checks
+// ---------------------------------------------------------------------------
+
+/** Quick check if Vibeshine's NVHTTP port is responding. */
+function checkVibeshineReachable(host: string, port: number, output: vscode.OutputChannel): Promise<boolean> {
+  return new Promise((resolve) => {
+    const http = require('http') as typeof import('http');
+    const net = require('net') as typeof import('net');
+
+    // Bypass VS Code/Cursor's proxy-patched http module by using a raw TCP socket
+    output.appendLine(`[PreFlight] Checking ${host}:${port}...`);
+    const socket = net.createConnection({ host, port }, () => {
+      output.appendLine('[PreFlight] TCP connected — Vibeshine is reachable');
+      socket.destroy();
+      resolve(true);
+    });
+    socket.setTimeout(5000);
+    socket.on('error', (err: Error) => {
+      output.appendLine(`[PreFlight] Error: ${err.message}`);
+      resolve(false);
+    });
+    socket.on('timeout', () => {
+      output.appendLine('[PreFlight] Timeout after 5s');
+      socket.destroy();
+      resolve(false);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Activation
 // ---------------------------------------------------------------------------
 
@@ -164,7 +194,31 @@ export function activate(context: vscode.ExtensionContext): void {
   // Connect command
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.connect, async () => {
+      // Guard: prevent concurrent connect flows
+      if (connManager.currentState !== 'disconnected') {
+        vscode.window.showWarningMessage(
+          `Moo Capture is currently ${connManager.currentState.replace(/_/g, ' ')}. Please wait or disconnect first.`,
+        );
+        return;
+      }
+
       const config = getConfig();
+
+      // Pre-flight: check if Vibeshine is reachable
+      const vibeshineOk = await checkVibeshineReachable(config.sunshineHost, config.sunshinePort, output);
+      if (!vibeshineOk) {
+        const action = await vscode.window.showErrorMessage(
+          'Vibeshine is not responding. Is the Vibeshine Service running?',
+          'Retry',
+          'Open Vibeshine Web UI',
+        );
+        if (action === 'Retry') {
+          await vscode.commands.executeCommand(COMMANDS.connect);
+        } else if (action === 'Open Vibeshine Web UI') {
+          vscode.env.openExternal(vscode.Uri.parse('https://localhost:47990'));
+        }
+        return;
+      }
 
       // If headless mode, ensure VDD is installed and credentials are available
       if (config.headlessMode) {
@@ -217,10 +271,30 @@ export function activate(context: vscode.ExtensionContext): void {
           },
         );
 
-        panel.onDidDispose(() => {
-          connManager.disconnect();
+        panel.onDidDispose(async () => {
+          // Prompt the user for what to do on tab close
+          const choice = await vscode.window.showInformationMessage(
+            'Moo Capture tab closed. What would you like to do?',
+            'Keep Relay Running',
+            'Stop Stream',
+            'Shutdown Everything',
+          );
+
+          if (choice === 'Shutdown Everything') {
+            connManager.dispose();
+            statusBar.text = STATE_LABELS.disconnected;
+            statusBar.tooltip = 'Relay stopped. Click to reconnect.';
+          } else if (choice === 'Stop Stream') {
+            connManager.disconnect();
+            statusBar.text = STATE_LABELS.disconnected;
+            statusBar.tooltip = 'Stream stopped. Relay still running for quick reconnect.';
+          } else {
+            // Keep Relay Running (or dismissed) — just cancel the active stream
+            connManager.disconnect();
+            statusBar.text = '$(game) Moo Capture (Ready)';
+            statusBar.tooltip = 'Relay running. Click to reconnect instantly.';
+          }
           panel = undefined;
-          statusBar.text = STATE_LABELS.disconnected;
         });
 
         // Show loading state while relay starts up
@@ -232,32 +306,41 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const { port, hostId, apps } = await connManager.connect(config, (pin: string) => {
           vscode.window.showInformationMessage(
-            `Enter this PIN in Vibeshine: ${pin}`,
+            `Enter PIN ${pin} in Vibeshine to pair.`,
             { modal: true },
+            'Open Vibeshine',
             'Done',
-          );
+          ).then((choice) => {
+            if (choice === 'Open Vibeshine') {
+              vscode.env.openExternal(vscode.Uri.parse('https://localhost:47990/#/clients'));
+            }
+          });
         });
+
+        if (!panel) {
+          output.appendLine('[Connect] Panel was closed during connection. Aborting.');
+          return;
+        }
 
         if (apps.length === 0) {
           panel.webview.html = getErrorHtml('No apps found in Vibeshine. Add apps at https://localhost:47990/applications');
           return;
         }
 
-        // Let user pick which app to stream
-        let selectedApp = apps[0];
-        if (apps.length > 1) {
-          const pick = await vscode.window.showQuickPick(
-            apps.map(a => ({ label: a.name, appId: a.id })),
-            { placeHolder: 'Select an app to stream' },
-          );
-          if (!pick) { return; } // User cancelled
-          selectedApp = { id: pick.appId, name: pick.label };
-        }
+        // Show the app launcher overlay inside the stream webview
+        output.appendLine(`[Connect] ${apps.length} app(s) available. Showing in-stream launcher.`);
+        panel.webview.html = getWebviewContent('', port, hostId, apps);
 
-        // Load stream.html directly with the selected app
-        const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${selectedApp.id}`;
-        output.appendLine(`[Connect] Streaming ${selectedApp.name}: ${streamUrl}`);
-        panel.webview.html = getWebviewContent(streamUrl);
+        // Listen for app selection from the webview
+        panel.webview.onDidReceiveMessage((msg: { command: string; appId?: number; appName?: string }) => {
+          if (msg.command === 'launchApp' && msg.appId !== undefined) {
+            const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${msg.appId}`;
+            output.appendLine(`[Connect] Launching ${msg.appName}: ${streamUrl}`);
+            if (panel) {
+              panel.webview.html = getWebviewContent(streamUrl, port, hostId, apps);
+            }
+          }
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         output.appendLine(`[Connect] Failed: ${msg}`);
@@ -268,15 +351,37 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  // Disconnect command
+  // Disconnect command (stops stream, keeps relay for quick reconnect)
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.disconnect, () => {
+      connManager.disconnect();
       if (panel) {
-        connManager.disconnect();
         panel.dispose();
         panel = undefined;
-        statusBar.text = STATE_LABELS.disconnected;
       }
+      statusBar.text = '$(game) Moo Capture (Ready)';
+      statusBar.tooltip = 'Stream stopped. Relay still running for quick reconnect.';
+    }),
+  );
+
+  // Shutdown command (stops everything — relay, stream, cleanup)
+  context.subscriptions.push(
+    vscode.commands.registerCommand(COMMANDS.shutdown, async () => {
+      const confirm = await vscode.window.showWarningMessage(
+        'Shut down Moo Capture completely? This stops the relay and stream.',
+        { modal: true },
+        'Shutdown',
+      );
+      if (confirm !== 'Shutdown') { return; }
+
+      connManager.dispose();
+      if (panel) {
+        panel.dispose();
+        panel = undefined;
+      }
+      statusBar.text = STATE_LABELS.disconnected;
+      statusBar.tooltip = 'Click to connect to Vibeshine';
+      vscode.window.showInformationMessage('Moo Capture shut down. Relay stopped.');
     }),
   );
 
@@ -341,8 +446,14 @@ export function deactivate(): void {
 // Webview HTML — iframe pointing to relay web UI
 // ---------------------------------------------------------------------------
 
-function getWebviewContent(streamUrl: string): string {
-  const relayUrl = streamUrl;
+function getWebviewContent(
+  streamUrl: string,
+  port?: number,
+  hostId?: number,
+  apps?: Array<{ id: number; name: string }>,
+): string {
+  const appsJson = JSON.stringify(apps || []).replace(/</g, '\\u003c');
+  const isStreaming = streamUrl !== '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -356,11 +467,16 @@ function getWebviewContent(streamUrl: string): string {
       height: 100%;
       overflow: hidden;
       background: #1e1e2e;
+      font-family: system-ui, -apple-system, sans-serif;
+      color: #cdd6f4;
     }
     iframe {
       width: 100%;
       height: 100%;
       border: none;
+    }
+    iframe.view-only {
+      pointer-events: none;
     }
     #exit-overlay {
       display: flex;
@@ -369,11 +485,97 @@ function getWebviewContent(streamUrl: string): string {
       position: fixed;
       inset: 0;
       background: #1e1e2e;
-      color: #cdd6f4;
-      font-family: system-ui, -apple-system, sans-serif;
       z-index: 10;
     }
     #exit-overlay.hidden { display: none; }
+
+    /* Toolbar — appears on hover */
+    #toolbar {
+      position: fixed;
+      top: 8px;
+      right: 8px;
+      z-index: 20;
+      display: flex;
+      gap: 6px;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    body:hover #toolbar { opacity: 1; }
+    .tb-btn {
+      background: rgba(30,30,46,0.9);
+      color: #cdd6f4;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font: 12px system-ui, sans-serif;
+      cursor: pointer;
+    }
+    .tb-btn:hover { background: rgba(69,71,90,0.95); }
+    .tb-btn.active { border-color: #f9e2af; color: #f9e2af; }
+
+    /* App launcher */
+    #app-launcher {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      gap: 16px;
+    }
+    #app-launcher h2 { margin: 0 0 8px; font-weight: 500; }
+    #app-launcher p { color: #a6adc8; margin: 0 0 24px; font-size: 0.9em; }
+    .app-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+      max-width: 600px;
+    }
+    .app-card {
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 10px;
+      padding: 20px 28px;
+      cursor: pointer;
+      transition: all 0.15s;
+      text-align: center;
+      min-width: 120px;
+    }
+    .app-card:hover {
+      background: #45475a;
+      border-color: #89b4fa;
+      transform: translateY(-2px);
+    }
+    .app-card .app-name { font-size: 14px; font-weight: 500; }
+
+    /* App picker dropdown (when streaming) */
+    #app-picker {
+      display: none;
+      position: fixed;
+      top: 40px;
+      right: 8px;
+      z-index: 25;
+      background: rgba(30,30,46,0.95);
+      border: 1px solid #45475a;
+      border-radius: 8px;
+      padding: 4px;
+      min-width: 160px;
+    }
+    #app-picker.open { display: block; }
+    .picker-item {
+      display: block;
+      width: 100%;
+      padding: 8px 12px;
+      background: none;
+      border: none;
+      color: #cdd6f4;
+      font: 13px system-ui, sans-serif;
+      text-align: left;
+      cursor: pointer;
+      border-radius: 4px;
+    }
+    .picker-item:hover { background: #45475a; }
+    .picker-item.current { color: #a6e3a1; }
   </style>
 </head>
 <body>
@@ -383,43 +585,140 @@ function getWebviewContent(streamUrl: string): string {
       <p style="color:#a6adc8;font-size:0.9em">You can close this tab or reconnect.</p>
     </div>
   </div>
-  <iframe
+
+  ${isStreaming ? '' : '<div id="app-launcher"></div>'}
+
+  <div id="toolbar" ${isStreaming ? '' : 'style="display:none"'}>
+    <button class="tb-btn" id="apps-btn" title="Switch app">Apps</button>
+    <button class="tb-btn" id="toggle-btn" title="Toggle view-only mode">Interactive</button>
+  </div>
+
+  <div id="app-picker"></div>
+
+  ${isStreaming ? `<iframe
     id="streamFrame"
-    src="${relayUrl}"
+    src="${streamUrl}"
     allow="autoplay; fullscreen; microphone; gamepad; camera; display-capture"
     allowfullscreen
-  ></iframe>
+  ></iframe>` : ''}
+
   <script>
     (function() {
-      const iframe = document.getElementById('streamFrame');
+      const vscode = acquireVsCodeApi();
+      const apps = ${appsJson};
+      const currentStreamUrl = '${streamUrl}';
+      const port = ${port || 0};
+      const hostId = ${hostId || 0};
 
-      // After each iframe page load, patch the iframe's window to:
-      // 1. Make it think it's a PWA (display-mode: standalone) so clicks
-      //    use window.location.href instead of window.open (which is blocked)
-      // 2. Suppress Keyboard.lock errors
-      function patchIframe() {
-        try {
-          const iframeWin = iframe.contentWindow;
+      // --- App Launcher (shown when no stream is active) ---
+      const launcher = document.getElementById('app-launcher');
+      if (launcher && apps.length > 0) {
+        let html = '<h2>Moo Capture</h2><p>Select an app to stream</p><div class="app-grid">';
+        apps.forEach(function(app) {
+          html += '<div class="app-card" data-id="' + app.id + '" data-name="' + app.name + '">';
+          html += '<div class="app-name">' + app.name + '</div>';
+          html += '</div>';
+        });
+        html += '</div>';
+        launcher.innerHTML = html;
 
-          // Override matchMedia to report standalone display mode
-          const origMatchMedia = iframeWin.matchMedia.bind(iframeWin);
-          iframeWin.matchMedia = function(query) {
-            if (query === '(display-mode: standalone)') {
-              return { matches: true, media: query, addEventListener: function(){}, removeEventListener: function(){} };
-            }
-            return origMatchMedia(query);
-          };
-
-          // Suppress Keyboard.lock errors
-          if (iframeWin.navigator && iframeWin.navigator.keyboard) {
-            iframeWin.navigator.keyboard.lock = function() { return Promise.resolve(); };
-          }
-        } catch(e) {
-          // cross-origin — cannot patch
-        }
+        launcher.querySelectorAll('.app-card').forEach(function(card) {
+          card.addEventListener('click', function() {
+            vscode.postMessage({
+              command: 'launchApp',
+              appId: parseInt(card.getAttribute('data-id')),
+              appName: card.getAttribute('data-name'),
+            });
+          });
+        });
       }
 
-      iframe.addEventListener('load', patchIframe);
+      // --- App Picker dropdown (shown when streaming) ---
+      const picker = document.getElementById('app-picker');
+      const appsBtn = document.getElementById('apps-btn');
+      if (appsBtn && picker && apps.length > 0) {
+        let pickerHtml = '';
+        apps.forEach(function(app) {
+          const isCurrent = currentStreamUrl.includes('appId=' + app.id);
+          pickerHtml += '<button class="picker-item' + (isCurrent ? ' current' : '') + '" data-id="' + app.id + '" data-name="' + app.name + '">';
+          pickerHtml += (isCurrent ? '> ' : '') + app.name;
+          pickerHtml += '</button>';
+        });
+        picker.innerHTML = pickerHtml;
+
+        appsBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          picker.classList.toggle('open');
+        });
+
+        picker.querySelectorAll('.picker-item').forEach(function(item) {
+          item.addEventListener('click', function() {
+            picker.classList.remove('open');
+            vscode.postMessage({
+              command: 'launchApp',
+              appId: parseInt(item.getAttribute('data-id')),
+              appName: item.getAttribute('data-name'),
+            });
+          });
+        });
+
+        // Close picker when clicking elsewhere
+        document.addEventListener('click', function() { picker.classList.remove('open'); });
+      }
+
+      // --- View-only toggle ---
+      const iframe = document.getElementById('streamFrame');
+      const toggleBtn = document.getElementById('toggle-btn');
+      if (toggleBtn && iframe) {
+        let viewOnly = false;
+        toggleBtn.addEventListener('click', function() {
+          viewOnly = !viewOnly;
+          iframe.classList.toggle('view-only', viewOnly);
+          toggleBtn.classList.toggle('active', viewOnly);
+          toggleBtn.textContent = viewOnly ? 'View Only' : 'Interactive';
+        });
+      }
+
+      // --- Iframe patching ---
+      if (iframe) {
+        function patchIframe() {
+          try {
+            const iframeWin = iframe.contentWindow;
+
+            // Override matchMedia to report standalone display mode
+            const origMatchMedia = iframeWin.matchMedia.bind(iframeWin);
+            iframeWin.matchMedia = function(query) {
+              if (query === '(display-mode: standalone)') {
+                return { matches: true, media: query, addEventListener: function(){}, removeEventListener: function(){} };
+              }
+              return origMatchMedia(query);
+            };
+
+            // Suppress Keyboard.lock errors
+            if (iframeWin.navigator && iframeWin.navigator.keyboard) {
+              iframeWin.navigator.keyboard.lock = function() { return Promise.resolve(); };
+            }
+
+            // Hide broken buttons in relay overlay
+            setTimeout(function() {
+              try {
+                var iframeDoc = iframe.contentDocument;
+                if (iframeDoc) {
+                  iframeDoc.querySelectorAll('button').forEach(function(btn) {
+                    var text = btn.textContent.trim();
+                    if (text === 'Lock Mouse' || text === 'Fullscreen' || text === 'Exit') {
+                      btn.style.display = 'none';
+                    }
+                  });
+                }
+              } catch(e2) {}
+            }, 1000);
+          } catch(e) {
+            // cross-origin — cannot patch
+          }
+        }
+        iframe.addEventListener('load', patchIframe);
+      }
     })();
   </script>
 </body>

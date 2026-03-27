@@ -17,6 +17,8 @@
   },
   "activationEvents": [
     "onCommand:moo-capture.connect",
+    "onCommand:moo-capture.disconnect",
+    "onCommand:moo-capture.shutdown",
     "onCommand:moo-capture.setupVirtualDisplay"
   ],
   "main": "./dist/extension.js",
@@ -32,6 +34,12 @@
         "command": "moo-capture.disconnect",
         "title": "Disconnect",
         "icon": "$(debug-disconnect)",
+        "category": "Moo Capture"
+      },
+      {
+        "command": "moo-capture.shutdown",
+        "title": "Shutdown Everything",
+        "icon": "$(stop-circle)",
         "category": "Moo Capture"
       },
       {

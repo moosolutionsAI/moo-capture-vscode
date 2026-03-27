@@ -44,6 +44,7 @@ export const EXTENSION_ID = 'moo-capture';
 export const COMMANDS = {
   connect: 'moo-capture.connect',
   disconnect: 'moo-capture.disconnect',
+  shutdown: 'moo-capture.shutdown',
   setupVirtualDisplay: 'moo-capture.setupVirtualDisplay',
 } as const;
 

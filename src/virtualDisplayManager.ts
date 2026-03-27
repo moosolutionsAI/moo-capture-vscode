@@ -11,8 +11,8 @@ import type { OutputChannel } from 'vscode';
 import type { DisplayInfo } from './types';
 import { VDD_GITHUB_REPO } from './constants';
 
-/** Hardware ID used by pnputil to enable/disable the VDD device. */
-const VDD_HARDWARE_ID = 'Root\\VirtualDisplayDriver';
+/** Friendly name pattern used to find the VDD device dynamically. */
+const VDD_FRIENDLY_NAME_PATTERN = '*Virtual Display*';
 
 /**
  * Manages the Virtual Display Driver lifecycle: installation, enable/disable,
@@ -184,11 +184,31 @@ export class VirtualDisplayManager {
   // -------------------------------------------------------------------------
 
   /**
+   * Dynamically resolves the VDD instance ID by querying for a device
+   * matching the friendly name pattern.
+   */
+  private resolveVddInstanceId(): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const cmd = `powershell -NoProfile -Command "Get-PnpDevice -FriendlyName '${VDD_FRIENDLY_NAME_PATTERN}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InstanceId"`;
+      exec(cmd, { timeout: 15000 }, (err, stdout) => {
+        const instanceId = stdout?.trim();
+        if (instanceId) {
+          this.output.appendLine(`[VDD] Resolved instance ID: ${instanceId}`);
+          resolve(instanceId);
+        } else {
+          reject(new Error('VDD device not found. Ensure the Virtual Display Driver is installed.'));
+        }
+      });
+    });
+  }
+
+  /**
    * Enables the VDD device via `pnputil /enable-device`.
    */
   async enableVdd(): Promise<void> {
+    const instanceId = await this.resolveVddInstanceId();
     return new Promise((resolve, reject) => {
-      const cmd = `powershell -NoProfile -Command "pnputil /enable-device '${VDD_HARDWARE_ID}'"`;
+      const cmd = `powershell -NoProfile -Command "pnputil /enable-device '${instanceId}'"`;
       this.output.appendLine('[VDD] Enabling virtual display device...');
 
       exec(cmd, { timeout: 15000 }, (err, stdout, stderr) => {
@@ -206,8 +226,9 @@ export class VirtualDisplayManager {
    * Disables the VDD device via `pnputil /disable-device`.
    */
   async disableVdd(): Promise<void> {
+    const instanceId = await this.resolveVddInstanceId();
     return new Promise((resolve, reject) => {
-      const cmd = `powershell -NoProfile -Command "pnputil /disable-device '${VDD_HARDWARE_ID}'"`;
+      const cmd = `powershell -NoProfile -Command "pnputil /disable-device '${instanceId}'"`;
       this.output.appendLine('[VDD] Disabling virtual display device...');
 
       exec(cmd, { timeout: 15000 }, (err, stdout, stderr) => {

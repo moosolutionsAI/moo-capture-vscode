@@ -152,6 +152,7 @@ export class RelayApiClient {
           ...this.authHeaders(),
         },
         timeout: 120000, // Pairing can take a while — user needs to enter PIN
+        agent: false, // Bypass VS Code/Cursor proxy-patched globalAgent
       };
 
       const req = http.request(options, (res) => {
@@ -178,7 +179,7 @@ export class RelayApiClient {
                 this.output.appendLine('[Relay API] Paired successfully');
                 resolve(msg.Paired as RelayHost);
               } else if ('PairError' in msg) {
-                reject(new Error('Pairing failed. Make sure you entered the correct PIN in Sunshine.'));
+                reject(new Error('Pairing failed. Make sure you entered the correct PIN in Vibeshine.'));
               }
             } catch {
               this.output.appendLine(`[Relay API] Pair: unparseable line: ${trimmed.substring(0, 100)}`);
@@ -207,7 +208,7 @@ export class RelayApiClient {
       req.on('error', reject);
       req.on('timeout', () => {
         req.destroy();
-        reject(new Error('Pairing timed out. Make sure Sunshine is running and you entered the PIN.'));
+        reject(new Error('Pairing timed out. Make sure Vibeshine is running and you entered the PIN.'));
       });
 
       req.write(body);
@@ -253,6 +254,7 @@ export class RelayApiClient {
         method,
         headers,
         timeout: 15000,
+        agent: false, // Bypass VS Code/Cursor proxy-patched globalAgent
       };
 
       this.output.appendLine(`[Relay API] ${method} ${urlPath} (auth: ${this.sessionCookie ? 'yes' : 'no'})`);
@@ -290,6 +292,7 @@ export class RelayApiClient {
         path: urlPath,
         method: 'GET',
         headers: this.authHeaders(),
+        agent: false, // Bypass VS Code/Cursor proxy-patched globalAgent
       };
 
       this.output.appendLine(`[Relay API] GET (streaming) ${urlPath} (auth: ${this.sessionCookie ? 'yes' : 'no'})`);

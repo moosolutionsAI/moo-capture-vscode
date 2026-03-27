@@ -85,7 +85,7 @@ export class ConnectionManager {
       await this.apiClient.login(RELAY_INTERNAL_USER, RELAY_INTERNAL_PASS);
 
       // Step 4: Ensure host is added AND paired
-      const host = await this.ensureHostPaired(config, onNeedPairPin);
+      let host = await this.ensureHostPaired(config, onNeedPairPin);
 
       // Step 4.5: Headless virtual display setup (non-blocking on failure)
       if (config.headlessMode) {
@@ -97,9 +97,22 @@ export class ConnectionManager {
         }
       }
 
-      // Step 5: Get apps list
+      // Step 5: Get apps list (retry with re-pair if stale pairing detected)
       this.lastHostId = host.host_id;
-      const apps = await this.apiClient.listApps(host.host_id);
+      let apps: import('./types').RelayApp[];
+      try {
+        apps = await this.apiClient.listApps(host.host_id);
+      } catch (appErr) {
+        const appMsg = appErr instanceof Error ? appErr.message : String(appErr);
+        if (appMsg.includes('HTTP')) {
+          this.output.appendLine(`[Connect] listApps failed (${appMsg}) — pairing may be stale. Re-pairing...`);
+          this.setState('pairing', 'Re-pairing with Vibeshine...');
+          host = await this.apiClient.pair(host.host_id, onNeedPairPin);
+          apps = await this.apiClient.listApps(host.host_id);
+        } else {
+          throw appErr;
+        }
+      }
       this.output.appendLine(`[Connect] Apps: ${apps.map(a => a.name).join(', ')}`);
 
       this.setState('streaming', 'Connected');
@@ -109,6 +122,8 @@ export class ConnectionManager {
       const msg = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[Connect] Error: ${msg}`);
       this.setState('error', msg);
+      // Reset to disconnected so user can retry
+      this.setState('disconnected');
       throw err;
     }
   }

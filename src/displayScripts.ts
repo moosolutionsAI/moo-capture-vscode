@@ -35,33 +35,6 @@ export interface WatchdogScriptOptions {
   teardownScriptPath: string;
 }
 
-// ---------------------------------------------------------------------------
-// Win32 SetDisplayConfig helper (shared across scripts)
-// ---------------------------------------------------------------------------
-
-const DISPLAY_HELPER_TYPE = `
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class DisplayHelper {
-    [DllImport("user32.dll")]
-    public static extern int SetDisplayConfig(
-        uint numPathArrayElements,
-        IntPtr pathArray,
-        uint numModeInfoArrayElements,
-        IntPtr modeInfoArray,
-        uint flags
-    );
-
-    public const uint SDC_TOPOLOGY_INTERNAL = 0x00000001;
-    public const uint SDC_TOPOLOGY_CLONE    = 0x00000002;
-    public const uint SDC_TOPOLOGY_EXTEND   = 0x00000004;
-    public const uint SDC_TOPOLOGY_EXTERNAL = 0x00000008;
-    public const uint SDC_APPLY             = 0x00000080;
-}
-"@
-`;
 
 // ---------------------------------------------------------------------------
 // Setup script
@@ -72,10 +45,11 @@ public class DisplayHelper {
  *  1. Snapshots current displays via dxgi-info.exe ("before").
  *  2. Enables the VDD device via pnputil.
  *  3. Polls for a new display to appear (max 10 s).
- *  4. Calls SetDisplayConfig with SDC_TOPOLOGY_EXTERNAL to keep only the
- *     virtual display (disables physical monitors).
- *  5. Writes a sentinel JSON file describing the session.
- *  6. Spawns the watchdog process in the background.
+ *  4. Writes a sentinel JSON file describing the session.
+ *  5. Spawns the watchdog process in the background.
+ *
+ * Physical monitors are left untouched — the virtual display is added as an
+ * extra monitor that Vibeshine captures from.
  */
 export function generateSetupScript(options: SetupScriptOptions): string {
   const {
@@ -95,7 +69,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-${DISPLAY_HELPER_TYPE}
 
 # ---------- Helper: run dxgi-info and parse displays ----------
 function Get-Displays {
@@ -124,9 +97,18 @@ Write-Host '[Setup] Enumerating displays (before)...'
 $before = Get-Displays -ExePath $DxgiInfoPath
 Write-Host "[Setup] Found $($before.Count) display(s) before enabling VDD."
 
+# ---------- Helper: Resolve VDD instance ID ----------
+function Get-VddInstanceId {
+    $device = Get-PnpDevice -FriendlyName '*Virtual Display*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($device) { return $device.InstanceId }
+    throw 'VDD device not found. Ensure the Virtual Display Driver is installed.'
+}
+
 # ---------- 2. Enable VDD ----------
+$VddInstanceId = Get-VddInstanceId
+Write-Host "[Setup] Resolved VDD instance ID: $VddInstanceId"
 Write-Host '[Setup] Enabling Virtual Display Driver...'
-pnputil /enable-device "Root\\VirtualDisplayDriver" | Out-Null
+pnputil /enable-device $VddInstanceId | Out-Null
 
 # ---------- 3. Poll for new display (max 10s) ----------
 Write-Host '[Setup] Waiting for virtual display to appear...'
@@ -150,36 +132,23 @@ if (-not $newDisplay) {
 }
 Write-Host "[Setup] New virtual display detected: $newDisplay"
 
-# ---------- 4. Disable physical displays (keep only virtual) ----------
-Write-Host '[Setup] Switching to external-only topology (virtual display only)...'
-$result = [DisplayHelper]::SetDisplayConfig(
-    0, [IntPtr]::Zero,
-    0, [IntPtr]::Zero,
-    ([DisplayHelper]::SDC_TOPOLOGY_EXTERNAL -bor [DisplayHelper]::SDC_APPLY)
-)
-if ($result -ne 0) {
-    Write-Warning "[Setup] SetDisplayConfig returned $result — physical displays may still be active."
-}
-
-# ---------- 5. Write sentinel file ----------
-$disabledDisplays = $before | Where-Object { $_.Name -ne $newDisplay } | ForEach-Object { $_.Name }
+# ---------- 4. Write sentinel file ----------
 $sentinel = @{
-    timestamp        = (Get-Date -Format 'o')
-    disabledDisplays = @($disabledDisplays)
-    virtualDisplay   = $newDisplay
-    teardownScript   = $TeardownScriptPath
+    timestamp      = (Get-Date -Format 'o')
+    virtualDisplay = $newDisplay
+    teardownScript = $TeardownScriptPath
 } | ConvertTo-Json -Depth 4
 
 Set-Content -Path $SentinelPath -Value $sentinel -Encoding UTF8
 Write-Host "[Setup] Sentinel written to $SentinelPath"
 
-# ---------- 6. Spawn watchdog ----------
+# ---------- 5. Spawn watchdog ----------
 Write-Host '[Setup] Starting watchdog process...'
 Start-Process -FilePath 'powershell.exe' \`
     -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $WatchdogScriptPath \`
     -WindowStyle Hidden
 
-Write-Host '[Setup] Done. Virtual display is active, physical displays are disabled.'
+Write-Host '[Setup] Done. Virtual display is active, physical displays unchanged.'
 `;
 }
 
@@ -189,11 +158,12 @@ Write-Host '[Setup] Done. Virtual display is active, physical displays are disab
 
 /**
  * Generates a PowerShell script that:
- *  1. Reads the sentinel file to learn which displays were disabled.
- *  2. Re-enables physical displays via SetDisplayConfig (extend topology).
- *  3. Disables the VDD device.
- *  4. Removes the sentinel file.
- *  5. Kills any running watchdog process.
+ *  1. Reads the sentinel file.
+ *  2. Disables the VDD device (removes the virtual display).
+ *  3. Removes the sentinel file.
+ *  4. Kills any running watchdog process.
+ *
+ * Physical monitors are never touched — only the virtual display is removed.
  */
 export function generateTeardownScript(options: TeardownScriptOptions): string {
   const { sentinelPath } = options;
@@ -205,7 +175,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-${DISPLAY_HELPER_TYPE}
 
 # ---------- 1. Read sentinel ----------
 if (-not (Test-Path $SentinelPath)) {
@@ -214,35 +183,32 @@ if (-not (Test-Path $SentinelPath)) {
 }
 
 $sentinel = Get-Content -Path $SentinelPath -Raw | ConvertFrom-Json
-Write-Host "[Teardown] Restoring displays disabled at $($sentinel.timestamp)"
-Write-Host "[Teardown] Disabled displays: $($sentinel.disabledDisplays -join ', ')"
+Write-Host "[Teardown] Removing virtual display created at $($sentinel.timestamp)"
 
-# ---------- 2. Re-enable physical displays ----------
-Write-Host '[Teardown] Restoring extend topology...'
-$result = [DisplayHelper]::SetDisplayConfig(
-    0, [IntPtr]::Zero,
-    0, [IntPtr]::Zero,
-    ([DisplayHelper]::SDC_TOPOLOGY_EXTEND -bor [DisplayHelper]::SDC_APPLY)
-)
-if ($result -ne 0) {
-    Write-Warning "[Teardown] SetDisplayConfig returned $result — displays may not be fully restored."
+# ---------- Helper: Resolve VDD instance ID ----------
+function Get-VddInstanceId {
+    $device = Get-PnpDevice -FriendlyName '*Virtual Display*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($device) { return $device.InstanceId }
+    throw 'VDD device not found.'
 }
 
-# ---------- 3. Disable VDD ----------
+# ---------- 2. Disable VDD ----------
+$VddInstanceId = Get-VddInstanceId
+Write-Host "[Teardown] Resolved VDD instance ID: $VddInstanceId"
 Write-Host '[Teardown] Disabling Virtual Display Driver...'
-pnputil /disable-device "Root\\VirtualDisplayDriver" | Out-Null
+pnputil /disable-device $VddInstanceId | Out-Null
 
-# ---------- 4. Remove sentinel ----------
+# ---------- 3. Remove sentinel ----------
 Remove-Item -Path $SentinelPath -Force -ErrorAction SilentlyContinue
 Write-Host '[Teardown] Sentinel removed.'
 
-# ---------- 5. Kill watchdog ----------
+# ---------- 4. Kill watchdog ----------
 Write-Host '[Teardown] Stopping watchdog process(es)...'
 Get-Process -Name 'powershell' -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*watchdog*' } |
     Stop-Process -Force -ErrorAction SilentlyContinue
 
-Write-Host '[Teardown] Restore complete.'
+Write-Host '[Teardown] Virtual display removed.'
 `;
 }
 

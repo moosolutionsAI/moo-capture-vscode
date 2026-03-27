@@ -92,8 +92,11 @@ export class SunshineConfigManager {
       filtered.unshift(mooPrepCmd);
       updated['prep-cmd'] = filtered;
 
-      // Set output to the virtual display so Sunshine captures from it
-      updated.output = virtualDisplayName;
+      // Set output to the virtual display so Sunshine captures from it.
+      // Skip if empty — the setup script will detect the display name at runtime.
+      if (virtualDisplayName) {
+        updated.output = virtualDisplayName;
+      }
 
       return updated;
     });
