@@ -40,6 +40,8 @@ const connectStatus = document.getElementById('connect-status')!;
 const hud = document.getElementById('hud')!;
 const btnDisconnect = document.getElementById('btn-disconnect')!;
 const hudGamepad = document.getElementById('hud-gamepad')!;
+const btnMute = document.getElementById('btn-mute') as HTMLButtonElement;
+const streamVideo = document.getElementById('stream-video') as HTMLVideoElement;
 
 // ---------------------------------------------------------------------------
 // UI State
@@ -175,6 +177,12 @@ btnConnect.addEventListener('click', () => {
 btnDisconnect.addEventListener('click', () => {
   disconnect();
   vscode.postMessage({ type: 'requestDisconnect' });
+});
+
+btnMute.addEventListener('click', () => {
+  streamVideo.muted = !streamVideo.muted;
+  btnMute.textContent = streamVideo.muted ? 'Unmute' : 'Mute';
+  btnMute.classList.toggle('active', !streamVideo.muted);
 });
 
 // ---------------------------------------------------------------------------

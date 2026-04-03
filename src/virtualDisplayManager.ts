@@ -5,6 +5,7 @@
 import { exec } from 'child_process';
 import * as https from 'https';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { createWriteStream } from 'fs';
 import type { OutputChannel } from 'vscode';
@@ -185,15 +186,27 @@ export class VirtualDisplayManager {
 
   /**
    * Dynamically resolves the VDD instance ID by querying for a device
-   * matching the friendly name pattern.
+   * matching the friendly name pattern.  Prefers a device whose status is
+   * OK (i.e. currently enabled) over one in an error/disconnected state.
    */
   private resolveVddInstanceId(): Promise<string> {
     return new Promise((resolve, reject) => {
-      const cmd = `powershell -NoProfile -Command "Get-PnpDevice -FriendlyName '${VDD_FRIENDLY_NAME_PATTERN}' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InstanceId"`;
+      // Return all matching devices as "Status|InstanceId" lines so we can
+      // pick the best candidate from TypeScript.
+      const cmd = `powershell -NoProfile -Command "Get-PnpDevice -FriendlyName '${VDD_FRIENDLY_NAME_PATTERN}' -ErrorAction SilentlyContinue | ForEach-Object { $_.Status + '|' + $_.InstanceId }"`;
       exec(cmd, { timeout: 15000 }, (err, stdout) => {
-        const instanceId = stdout?.trim();
+        const lines = (stdout ?? '').trim().split('\n').map(l => l.trim()).filter(Boolean);
+        if (lines.length === 0) {
+          reject(new Error('VDD device not found. Ensure the Virtual Display Driver is installed.'));
+          return;
+        }
+
+        // Prefer a device with Status "OK" (enabled); fall back to any other
+        let bestLine = lines.find(l => l.startsWith('OK|')) ?? lines[0];
+        const instanceId = bestLine.split('|').slice(1).join('|');
+
         if (instanceId) {
-          this.output.appendLine(`[VDD] Resolved instance ID: ${instanceId}`);
+          this.output.appendLine(`[VDD] Resolved instance ID: ${instanceId} (from ${lines.length} candidate(s))`);
           resolve(instanceId);
         } else {
           reject(new Error('VDD device not found. Ensure the Virtual Display Driver is installed.'));
@@ -238,6 +251,157 @@ export class VirtualDisplayManager {
           this.output.appendLine(`[VDD] Disable result: ${stdout.trim()}`);
           resolve();
         }
+      });
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Virtual display detection
+  // -------------------------------------------------------------------------
+
+  /** Known hardware-ID substrings that identify virtual display monitors. */
+  private static readonly VDD_HARDWARE_PATTERNS = [
+    'SMKD',       // SudoMaker Virtual Display Adapter
+    'MttVDD',     // MikeTheTech Virtual Display Driver
+  ];
+
+  /**
+   * Identifies the virtual display by using Win32 `QueryDisplayConfig` to
+   * map each GDI device name (e.g. `\\.\DISPLAY10`) to its monitor device
+   * path which contains the hardware ID.  The virtual display is the one
+   * whose path matches a known VDD pattern (e.g. "SMKD" for SudoMaker).
+   *
+   * This works regardless of how many physical monitors are connected.
+   */
+  async detectVirtualDisplayName(_dxgiInfoPath: string): Promise<string> {
+    const mappings = await this.queryDisplayConfig();
+
+    for (const m of mappings) {
+      this.output.appendLine(`[VDD] ${m.gdiName} → ${m.monitorPath} (${m.friendlyName})`);
+    }
+
+    // Find the display whose monitor path matches a VDD hardware pattern
+    for (const m of mappings) {
+      const pathUpper = m.monitorPath.toUpperCase();
+      for (const pattern of VirtualDisplayManager.VDD_HARDWARE_PATTERNS) {
+        if (pathUpper.includes(pattern.toUpperCase())) {
+          this.output.appendLine(`[VDD] Matched virtual display: ${m.gdiName} (pattern: ${pattern}, name: ${m.friendlyName})`);
+          return m.gdiName;
+        }
+      }
+    }
+
+    this.output.appendLine('[VDD] No virtual display matched any known VDD hardware pattern.');
+    return '';
+  }
+
+  /**
+   * Uses Win32 `QueryDisplayConfig` + `DisplayConfigGetDeviceInfo` via
+   * PowerShell P/Invoke to map each active GDI display name to its
+   * monitor device path (which contains the hardware ID).
+   */
+  private queryDisplayConfig(): Promise<Array<{
+    gdiName: string;
+    friendlyName: string;
+    monitorPath: string;
+  }>> {
+    // Write the P/Invoke script to a temp file to avoid all shell escaping
+    // issues with $, quotes, and @ characters.
+    const scriptPath = path.join(
+      os.tmpdir(),
+      `moo-capture-qdc-${process.pid}.ps1`,
+    );
+
+    const scriptContent = [
+      'Add-Type -TypeDefinition @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public class QDC {',
+      '    public const uint QDC_ONLY_ACTIVE_PATHS = 2;',
+      '    public const uint GET_SOURCE_NAME = 1;',
+      '    public const uint GET_TARGET_NAME = 2;',
+      '    [StructLayout(LayoutKind.Sequential)]',
+      '    public struct LUID { public uint LowPart; public int HighPart; }',
+      '    [StructLayout(LayoutKind.Sequential)]',
+      '    public struct RATIONAL { public uint Num; public uint Den; }',
+      '    [StructLayout(LayoutKind.Sequential)]',
+      '    public struct PATH_SOURCE { public LUID adapterId; public uint id; public uint modeIdx; public uint flags; }',
+      '    [StructLayout(LayoutKind.Sequential)]',
+      '    public struct PATH_TARGET {',
+      '        public LUID adapterId; public uint id; public uint modeIdx;',
+      '        public uint outTech; public uint rot; public uint scale;',
+      '        public RATIONAL refresh; public uint scanLine;',
+      '        public int available; public uint flags;',
+      '    }',
+      '    [StructLayout(LayoutKind.Sequential)]',
+      '    public struct PATH_INFO { public PATH_SOURCE src; public PATH_TARGET tgt; public uint flags; }',
+      '    [StructLayout(LayoutKind.Sequential)]',
+      '    public struct MODE_INFO {',
+      '        public uint infoType; public uint id; public LUID adapterId;',
+      '        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)] public byte[] data;',
+      '    }',
+      '    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+      '    public struct SOURCE_NAME {',
+      '        public uint type; public uint size; public LUID adapterId; public uint id;',
+      '        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string name;',
+      '    }',
+      '    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+      '    public struct TARGET_NAME {',
+      '        public uint type; public uint size; public LUID adapterId; public uint id;',
+      '        public uint flags; public uint outTech;',
+      '        public ushort edidMfr; public ushort edidProd; public uint connInst;',
+      '        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string friendly;',
+      '        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string path;',
+      '    }',
+      '    [DllImport("user32.dll")] public static extern int GetDisplayConfigBufferSizes(uint f, out uint p, out uint m);',
+      '    [DllImport("user32.dll")] public static extern int QueryDisplayConfig(uint f, ref uint np, [Out] PATH_INFO[] pa, ref uint nm, [Out] MODE_INFO[] ma, IntPtr t);',
+      '    [DllImport("user32.dll")] public static extern int DisplayConfigGetDeviceInfo(ref SOURCE_NAME n);',
+      '    [DllImport("user32.dll")] public static extern int DisplayConfigGetDeviceInfo(ref TARGET_NAME n);',
+      '}',
+      '"@',
+      '$np=[uint32]0; $nm=[uint32]0',
+      '[void][QDC]::GetDisplayConfigBufferSizes([QDC]::QDC_ONLY_ACTIVE_PATHS,[ref]$np,[ref]$nm)',
+      '$pa=New-Object QDC+PATH_INFO[] $np; $ma=New-Object QDC+MODE_INFO[] $nm',
+      '[void][QDC]::QueryDisplayConfig([QDC]::QDC_ONLY_ACTIVE_PATHS,[ref]$np,$pa,[ref]$nm,$ma,[IntPtr]::Zero)',
+      'for($i=0;$i -lt $np;$i++){',
+      '  $s=New-Object QDC+SOURCE_NAME',
+      '  $s.type=[QDC]::GET_SOURCE_NAME',
+      '  $s.size=[uint32][Runtime.InteropServices.Marshal]::SizeOf($s)',
+      '  $s.adapterId=$pa[$i].src.adapterId; $s.id=$pa[$i].src.id',
+      '  [void][QDC]::DisplayConfigGetDeviceInfo([ref]$s)',
+      '  $t=New-Object QDC+TARGET_NAME',
+      '  $t.type=[QDC]::GET_TARGET_NAME',
+      '  $t.size=[uint32][Runtime.InteropServices.Marshal]::SizeOf($t)',
+      '  $t.adapterId=$pa[$i].tgt.adapterId; $t.id=$pa[$i].tgt.id',
+      '  [void][QDC]::DisplayConfigGetDeviceInfo([ref]$t)',
+      '  Write-Output "$($s.name)|$($t.friendly)|$($t.path)"',
+      '}',
+    ].join('\n');
+
+    fs.writeFileSync(scriptPath, scriptContent, 'utf-8');
+
+    return new Promise((resolve, reject) => {
+      const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`;
+      exec(cmd, { timeout: 15000 }, (err, stdout) => {
+        // Clean up temp file
+        try { fs.unlinkSync(scriptPath); } catch { /* ok */ }
+
+        if (err) {
+          reject(new Error(`QueryDisplayConfig failed: ${err.message}`));
+          return;
+        }
+        const results = stdout.trim().split('\n')
+          .map(l => l.trim())
+          .filter(Boolean)
+          .map(line => {
+            const parts = line.split('|');
+            return {
+              gdiName: parts[0] ?? '',
+              friendlyName: parts[1] ?? '',
+              monitorPath: parts[2] ?? '',
+            };
+          });
+        resolve(results);
       });
     });
   }

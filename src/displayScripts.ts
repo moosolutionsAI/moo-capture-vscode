@@ -99,9 +99,12 @@ Write-Host "[Setup] Found $($before.Count) display(s) before enabling VDD."
 
 # ---------- Helper: Resolve VDD instance ID ----------
 function Get-VddInstanceId {
-    $device = Get-PnpDevice -FriendlyName '*Virtual Display*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($device) { return $device.InstanceId }
-    throw 'VDD device not found. Ensure the Virtual Display Driver is installed.'
+    $devices = Get-PnpDevice -FriendlyName '*Virtual Display*' -ErrorAction SilentlyContinue
+    if (-not $devices) { throw 'VDD device not found. Ensure the Virtual Display Driver is installed.' }
+    # Prefer a device with Status OK (enabled) over one in error/disconnected state
+    $ok = $devices | Where-Object { $_.Status -eq 'OK' } | Select-Object -First 1
+    if ($ok) { return $ok.InstanceId }
+    return ($devices | Select-Object -First 1).InstanceId
 }
 
 # ---------- 2. Enable VDD ----------
@@ -187,9 +190,12 @@ Write-Host "[Teardown] Removing virtual display created at $($sentinel.timestamp
 
 # ---------- Helper: Resolve VDD instance ID ----------
 function Get-VddInstanceId {
-    $device = Get-PnpDevice -FriendlyName '*Virtual Display*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($device) { return $device.InstanceId }
-    throw 'VDD device not found.'
+    $devices = Get-PnpDevice -FriendlyName '*Virtual Display*' -ErrorAction SilentlyContinue
+    if (-not $devices) { throw 'VDD device not found.' }
+    # Prefer a device with Status OK (enabled) over one in error/disconnected state
+    $ok = $devices | Where-Object { $_.Status -eq 'OK' } | Select-Object -First 1
+    if ($ok) { return $ok.InstanceId }
+    return ($devices | Select-Object -First 1).InstanceId
 }
 
 # ---------- 2. Disable VDD ----------

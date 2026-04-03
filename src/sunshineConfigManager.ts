@@ -25,26 +25,37 @@ export class SunshineConfigManager {
    *
    * @returns Array of app objects from the Sunshine configuration.
    */
-  async getSunshineApps(username: string, password: string): Promise<any[]> {
+  async getSunshineApps(username: string, password: string): Promise<{ env: any; apps: any[] }> {
     const data = await this.apiRequest('GET', '/api/apps', username, password);
     const parsed = JSON.parse(data);
     // The API returns { env: {}, apps: [...] }
-    return parsed.apps || [];
+    return { env: parsed.env ?? {}, apps: parsed.apps || [] };
   }
 
   /**
-   * Writes the full apps array back to Sunshine via the REST API.
+   * Saves each app individually via the Sunshine REST API.
    *
-   * POST https://localhost:47990/api/apps (Vibeshine REST API)
+   * Sunshine's POST /api/apps expects a single app object per request
+   * (not the batched `{env, apps}` format returned by GET).
    */
   async updateSunshineApps(
     username: string,
     password: string,
+    _env: any,
     apps: any[],
   ): Promise<void> {
-    const body = JSON.stringify({ env: {}, apps });
-    await this.apiRequest('POST', '/api/apps', username, password, body);
-    this.output.appendLine('[VibeshineConfig] Apps updated successfully.');
+    for (const app of apps) {
+      // Sunshine expects numeric fields as actual numbers, not strings
+      const sanitized = { ...app };
+      if (typeof sanitized.index === 'string') {
+        sanitized.index = Number(sanitized.index);
+      }
+
+      const body = JSON.stringify(sanitized);
+      this.output.appendLine(`[VibeshineConfig] POST app "${sanitized.name}": ${body}`);
+      await this.apiRequest('POST', '/api/apps', username, password, body);
+      this.output.appendLine(`[VibeshineConfig] App "${sanitized.name}" saved.`);
+    }
   }
 
   /**

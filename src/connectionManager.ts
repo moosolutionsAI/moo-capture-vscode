@@ -176,18 +176,33 @@ export class ConnectionManager {
 
     this.output.appendLine(`[Connect] Display scripts written to ${scriptsDir}`);
 
+    // Detect the virtual display name.  Some VDD drivers (e.g. SudoMaker)
+    // stay permanently enabled and can't be toggled with pnputil on
+    // Windows 11 Home, so we identify the virtual display by finding which
+    // active screen is NOT the primary monitor.
+    let virtualDisplayName = '';
+    try {
+      virtualDisplayName = await this.vdm.detectVirtualDisplayName(VIBESHINE_DXGI_INFO);
+      if (virtualDisplayName) {
+        this.output.appendLine(`[Connect] Detected virtual display: ${virtualDisplayName}`);
+      } else {
+        this.output.appendLine('[Connect] Could not detect virtual display — output field will be empty.');
+      }
+    } catch (detectErr) {
+      const msg = detectErr instanceof Error ? detectErr.message : String(detectErr);
+      this.output.appendLine(`[Connect] Virtual display detection failed (non-fatal): ${msg}`);
+    }
+
     // Update Vibeshine apps via REST API if credentials are available
     if (this.vibeshineUsername && this.vibeshinePassword) {
       try {
-        const apps = await this.sunshineConfig.getSunshineApps(
+        const { env, apps } = await this.sunshineConfig.getSunshineApps(
           this.vibeshineUsername,
           this.vibeshinePassword,
         );
 
         this.output.appendLine(`[Connect] Found ${apps.length} Vibeshine app(s). Adding prep commands...`);
 
-        // Use the virtual display resolution from config, or a default name
-        const virtualDisplayName = '';  // Will be determined at runtime by the setup script
         const updatedApps = this.sunshineConfig.addPrepCommandsToApps(
           apps,
           setupScriptPath,
@@ -198,6 +213,7 @@ export class ConnectionManager {
         await this.sunshineConfig.updateSunshineApps(
           this.vibeshineUsername,
           this.vibeshinePassword,
+          env,
           updatedApps,
         );
 
