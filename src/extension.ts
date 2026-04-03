@@ -572,6 +572,7 @@ function getWebviewContent(
   <div id="toolbar" ${isStreaming ? '' : 'style="display:none"'}>
     <button class="tb-btn" id="apps-btn" title="Switch app">Apps</button>
     <button class="tb-btn" id="toggle-btn" title="Toggle view-only mode">Interactive</button>
+    <button class="tb-btn" id="mute-btn" title="Toggle audio">Unmute</button>
   </div>
 
   <div id="app-picker"></div>
@@ -645,6 +646,25 @@ function getWebviewContent(
 
         // Close picker when clicking elsewhere
         document.addEventListener('click', function() { picker.classList.remove('open'); });
+      }
+
+      // --- Mute toggle ---
+      const muteBtn = document.getElementById('mute-btn');
+      if (muteBtn) {
+        let muted = true;
+        muteBtn.addEventListener('click', function() {
+          muted = !muted;
+          muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+          muteBtn.classList.toggle('active', !muted);
+          // Mute/unmute all audio in the iframe
+          try {
+            const frame = document.getElementById('streamFrame');
+            if (frame && frame.contentDocument) {
+              var videos = frame.contentDocument.querySelectorAll('video, audio');
+              videos.forEach(function(v) { v.muted = muted; });
+            }
+          } catch(e) { /* cross-origin — iframe handles its own audio */ }
+        });
       }
 
       // --- View-only toggle ---

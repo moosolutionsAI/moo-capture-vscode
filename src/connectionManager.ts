@@ -1,21 +1,12 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import type { OutputChannel } from 'vscode';
 import { RelayManager } from './relayManager';
 import { RelayDownloader } from './relayDownloader';
 import { RelayApiClient } from './relayApiClient';
-import { VirtualDisplayManager } from './virtualDisplayManager';
 import { SunshineConfigManager } from './sunshineConfigManager';
-import {
-  generateSetupScript,
-  generateTeardownScript,
-  generateWatchdogScript,
-} from './displayScripts';
 import {
   RELAY_DEFAULT_PORT,
   RELAY_INTERNAL_USER,
   RELAY_INTERNAL_PASS,
-  VIBESHINE_DXGI_INFO,
 } from './constants';
 import type { ConnectionState, MooCaptureConfig, RelayHost } from './types';
 
@@ -27,7 +18,6 @@ export class ConnectionManager {
   private lastHostId: number | null = null;
   private onStateChange?: (state: ConnectionState, message?: string) => void;
 
-  private vdm: VirtualDisplayManager | null = null;
   private sunshineConfig: SunshineConfigManager | null = null;
 
   /** Vibeshine REST API credentials (set externally before connect if headless). */
@@ -63,7 +53,7 @@ export class ConnectionManager {
     onNeedPairPin: (pin: string) => void,
   ): Promise<{ port: number; hostId: number; apps: import('./types').RelayApp[] }> {
     try {
-      const port = config.relayPort || RELAY_DEFAULT_PORT;
+      let port = config.relayPort || RELAY_DEFAULT_PORT;
 
       // Step 1: Ensure relay binary exists
       if (!this.downloader.isInstalled()) {
@@ -73,14 +63,29 @@ export class ConnectionManager {
         });
       }
 
-      // Step 2: Start relay
+      // Step 2: Start relay (try alternative ports if default is taken)
       this.setState('starting_relay', 'Starting streaming relay...');
       if (!this.relay.isRunning) {
-        await this.relay.start(
-          this.downloader.binaryPath,
-          port,
-          this.globalStoragePath,
-        );
+        const maxPortAttempts = 5;
+        for (let attempt = 0; attempt < maxPortAttempts; attempt++) {
+          try {
+            await this.relay.start(
+              this.downloader.binaryPath,
+              port + attempt,
+              this.globalStoragePath,
+            );
+            port = port + attempt;
+            break;
+          } catch (startErr) {
+            const msg = startErr instanceof Error ? startErr.message : String(startErr);
+            if (msg.includes('10048') || msg.includes('address already in use')) {
+              this.output.appendLine(`[Connect] Port ${port + attempt} in use, trying ${port + attempt + 1}...`);
+              if (attempt === maxPortAttempts - 1) { throw startErr; }
+            } else {
+              throw startErr;
+            }
+          }
+        }
       }
 
       // Step 3: Login
@@ -174,7 +179,12 @@ export class ConnectionManager {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.output.appendLine(`[Connect] Failed to update Vibeshine apps: ${msg}`);
-        // Non-fatal — the scripts are written, user can configure manually
+        if (msg.includes('401') || msg.includes('Unauthorized')) {
+          // Clear stale credentials so user is prompted again next time
+          this.vibeshineUsername = '';
+          this.vibeshinePassword = '';
+          this.output.appendLine('[Connect] Vibeshine credentials rejected — will prompt for new credentials on next connect.');
+        }
       }
     } else {
       this.output.appendLine('[Connect] No Vibeshine credentials — scripts written but apps not auto-configured.');
@@ -191,9 +201,16 @@ export class ConnectionManager {
   ): Promise<RelayHost> {
     if (!this.apiClient) { throw new Error('Not logged in'); }
 
-    // List existing hosts
-    const hosts = await this.apiClient.listHosts();
-    this.output.appendLine(`[Connect] Found ${hosts.length} hosts: ${JSON.stringify(hosts.map(h => ({ id: h.host_id, name: h.name, paired: h.paired })))}`);
+    // List existing hosts — deduplicate by host_id (the relay's SSE stream
+    // can return the same host multiple times)
+    const rawHosts = await this.apiClient.listHosts();
+    const seen = new Set<number>();
+    const hosts = rawHosts.filter(h => {
+      if (seen.has(h.host_id)) { return false; }
+      seen.add(h.host_id);
+      return true;
+    });
+    this.output.appendLine(`[Connect] Found ${hosts.length} host(s): ${JSON.stringify(hosts.map(h => ({ id: h.host_id, name: h.name, paired: h.paired })))}`);
 
     let host = hosts.length > 0 ? hosts[0] : null;
 
@@ -244,17 +261,7 @@ export class ConnectionManager {
       this.output.appendLine(`[Disconnect] Cancelled stream on host ${this.lastHostId}`);
     }
 
-    // Verify displays were restored if headless was active
-    if (this.vdm) {
-      this.setState('tearing_down_display', 'Restoring displays...');
-      const sentinelPath = path.join(this.globalStoragePath, 'headless-sentinel.json');
-      if (fs.existsSync(sentinelPath)) {
-        this.output.appendLine('[Disconnect] Sentinel file still exists — teardown script should handle cleanup.');
-        // The teardown is handled by Sunshine's prep-cmd undo, but log for awareness
-      }
-      this.vdm = null;
-      this.sunshineConfig = null;
-    }
+    this.sunshineConfig = null;
 
     this.setState('disconnected');
   }
