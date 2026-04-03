@@ -72,7 +72,6 @@ export class SunshineConfigManager {
     apps: any[],
     doScriptPath: string,
     undoScriptPath: string,
-    virtualDisplayName: string,
   ): any[] {
     const doCmd = `powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "${doScriptPath.replace(/\\/g, '\\\\')}"`;
     const undoCmd = `powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "${undoScriptPath.replace(/\\/g, '\\\\')}"`;
@@ -103,11 +102,13 @@ export class SunshineConfigManager {
       filtered.unshift(mooPrepCmd);
       updated['prep-cmd'] = filtered;
 
-      // Set output to the virtual display so Sunshine captures from it.
-      // Skip if empty — the setup script will detect the display name at runtime.
-      if (virtualDisplayName) {
-        updated.output = virtualDisplayName;
-      }
+      // Use Vibeshine's built-in virtual display instead of targeting a
+      // specific physical display.  This tells Vibeshine to create and
+      // capture from its own headless virtual display automatically.
+      updated['virtual-screen'] = true;
+      updated['virtual-display-layout'] = 'extended';
+      // Remove any stale output override — let Vibeshine manage the display
+      delete updated.output;
 
       return updated;
     });

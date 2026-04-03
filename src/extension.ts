@@ -192,15 +192,15 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // Connect command
+  let connectInProgress = false;
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.connect, async () => {
       // Guard: prevent concurrent connect flows
-      if (connManager.currentState !== 'disconnected') {
-        vscode.window.showWarningMessage(
-          `Moo Capture is currently ${connManager.currentState.replace(/_/g, ' ')}. Please wait or disconnect first.`,
-        );
+      if (connectInProgress || connManager.currentState !== 'disconnected') {
+        output.appendLine('[Connect] Ignoring duplicate connect request.');
         return;
       }
+      connectInProgress = true;
 
       const config = getConfig();
 
@@ -347,6 +347,8 @@ export function activate(context: vscode.ExtensionContext): void {
         if (panel) {
           panel.webview.html = getErrorHtml(msg);
         }
+      } finally {
+        connectInProgress = false;
       }
     }),
   );

@@ -104,7 +104,15 @@ export class RelayApiClient {
 
   /** List apps on a host. Requires the host to be paired. */
   async listApps(hostId: number): Promise<RelayApp[]> {
-    const { res, body } = await this.request('GET', `/api/apps?host_id=${hostId}`);
+    // Retry once — Vibeshine can be slow to respond after config updates
+    let res: http.IncomingMessage;
+    let body: string;
+    try {
+      ({ res, body } = await this.request('GET', `/api/apps?host_id=${hostId}`));
+    } catch {
+      this.output.appendLine('[Relay API] First listApps attempt failed, retrying...');
+      ({ res, body } = await this.request('GET', `/api/apps?host_id=${hostId}`));
+    }
     this.output.appendLine(`[Relay API] Apps: ${res.statusCode} ${body.substring(0, 200)}`);
 
     if (res.statusCode !== 200) {
@@ -253,7 +261,7 @@ export class RelayApiClient {
         path: urlPath,
         method,
         headers,
-        timeout: 15000,
+        timeout: 30000,
         agent: false, // Bypass VS Code/Cursor proxy-patched globalAgent
       };
 

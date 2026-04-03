@@ -34,6 +34,9 @@ export class ConnectionManager {
   vibeshineUsername: string = '';
   vibeshinePassword: string = '';
 
+  /** Apps cached from Vibeshine REST API — used as fallback when relay listApps times out. */
+  private cachedVibeshineApps: import('./types').RelayApp[] = [];
+
   constructor(
     private readonly output: OutputChannel,
     private readonly globalStoragePath: string,
@@ -97,7 +100,7 @@ export class ConnectionManager {
         }
       }
 
-      // Step 5: Get apps list (retry with re-pair if stale pairing detected)
+      // Step 5: Get apps list — try relay first, fall back to cached Vibeshine apps
       this.lastHostId = host.host_id;
       let apps: import('./types').RelayApp[];
       try {
@@ -109,6 +112,9 @@ export class ConnectionManager {
           this.setState('pairing', 'Re-pairing with Vibeshine...');
           host = await this.apiClient.pair(host.host_id, onNeedPairPin);
           apps = await this.apiClient.listApps(host.host_id);
+        } else if (this.cachedVibeshineApps.length > 0) {
+          this.output.appendLine(`[Connect] Relay listApps timed out — using ${this.cachedVibeshineApps.length} app(s) from Vibeshine REST API.`);
+          apps = this.cachedVibeshineApps;
         } else {
           throw appErr;
         }
@@ -176,24 +182,9 @@ export class ConnectionManager {
 
     this.output.appendLine(`[Connect] Display scripts written to ${scriptsDir}`);
 
-    // Detect the virtual display name.  Some VDD drivers (e.g. SudoMaker)
-    // stay permanently enabled and can't be toggled with pnputil on
-    // Windows 11 Home, so we identify the virtual display by finding which
-    // active screen is NOT the primary monitor.
-    let virtualDisplayName = '';
-    try {
-      virtualDisplayName = await this.vdm.detectVirtualDisplayName(VIBESHINE_DXGI_INFO);
-      if (virtualDisplayName) {
-        this.output.appendLine(`[Connect] Detected virtual display: ${virtualDisplayName}`);
-      } else {
-        this.output.appendLine('[Connect] Could not detect virtual display — output field will be empty.');
-      }
-    } catch (detectErr) {
-      const msg = detectErr instanceof Error ? detectErr.message : String(detectErr);
-      this.output.appendLine(`[Connect] Virtual display detection failed (non-fatal): ${msg}`);
-    }
-
-    // Update Vibeshine apps via REST API if credentials are available
+    // Update Vibeshine apps via REST API if credentials are available.
+    // We configure each app to use Vibeshine's built-in virtual display
+    // (virtual-screen=true) instead of targeting a specific physical display.
     if (this.vibeshineUsername && this.vibeshinePassword) {
       try {
         const { env, apps } = await this.sunshineConfig.getSunshineApps(
@@ -207,7 +198,6 @@ export class ConnectionManager {
           apps,
           setupScriptPath,
           teardownScriptPath,
-          virtualDisplayName,
         );
 
         await this.sunshineConfig.updateSunshineApps(
@@ -218,6 +208,12 @@ export class ConnectionManager {
         );
 
         this.output.appendLine('[Connect] Vibeshine apps updated with headless prep commands.');
+
+        // Cache the apps so we can use them if the relay's listApps times out
+        this.cachedVibeshineApps = apps.map((a: any) => ({
+          id: Number(a.id) || 0,
+          name: a.name || 'Unknown',
+        }));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.output.appendLine(`[Connect] Failed to update Vibeshine apps: ${msg}`);
