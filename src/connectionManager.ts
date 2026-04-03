@@ -138,53 +138,14 @@ export class ConnectionManager {
   // Headless virtual display setup
   // -------------------------------------------------------------------------
 
-  private async setupHeadlessDisplay(config: MooCaptureConfig): Promise<void> {
-    this.setState('setting_up_display', 'Setting up virtual display...');
+  private async setupHeadlessDisplay(_config: MooCaptureConfig): Promise<void> {
+    this.setState('setting_up_display', 'Configuring Vibeshine virtual display...');
 
-    this.vdm = new VirtualDisplayManager(this.output);
     this.sunshineConfig = new SunshineConfigManager(this.output);
 
-    // Check if VDD is installed
-    const installed = await this.vdm.isVddInstalled();
-    if (!installed) {
-      this.output.appendLine('[Connect] VDD not installed — skipping headless setup.');
-      throw new Error('Virtual Display Driver is not installed. Run "Moo Capture: Setup Virtual Display" first.');
-    }
-
-    // Write scripts to globalStoragePath/scripts/
-    const scriptsDir = path.join(this.globalStoragePath, 'scripts');
-    fs.mkdirSync(scriptsDir, { recursive: true });
-
-    const sentinelPath = path.join(this.globalStoragePath, 'headless-sentinel.json');
-    const setupScriptPath = path.join(scriptsDir, 'setup.ps1');
-    const teardownScriptPath = path.join(scriptsDir, 'teardown.ps1');
-    const watchdogScriptPath = path.join(scriptsDir, 'watchdog.ps1');
-
-    const setupScript = generateSetupScript({
-      dxgiInfoPath: VIBESHINE_DXGI_INFO,
-      sentinelPath,
-      watchdogScriptPath,
-      teardownScriptPath,
-    });
-
-    const teardownScript = generateTeardownScript({
-      sentinelPath,
-    });
-
-    const watchdogScript = generateWatchdogScript({
-      sentinelPath,
-      teardownScriptPath,
-    });
-
-    fs.writeFileSync(setupScriptPath, setupScript, 'utf-8');
-    fs.writeFileSync(teardownScriptPath, teardownScript, 'utf-8');
-    fs.writeFileSync(watchdogScriptPath, watchdogScript, 'utf-8');
-
-    this.output.appendLine(`[Connect] Display scripts written to ${scriptsDir}`);
-
-    // Update Vibeshine apps via REST API if credentials are available.
-    // We configure each app to use Vibeshine's built-in virtual display
-    // (virtual-screen=true) instead of targeting a specific physical display.
+    // Update Vibeshine apps via REST API to use the built-in virtual display.
+    // No prep-cmd scripts needed — Vibeshine's display helper manages the
+    // virtual display lifecycle when virtual-screen=true.
     if (this.vibeshineUsername && this.vibeshinePassword) {
       try {
         const { env, apps } = await this.sunshineConfig.getSunshineApps(
@@ -192,13 +153,9 @@ export class ConnectionManager {
           this.vibeshinePassword,
         );
 
-        this.output.appendLine(`[Connect] Found ${apps.length} Vibeshine app(s). Adding prep commands...`);
+        this.output.appendLine(`[Connect] Found ${apps.length} Vibeshine app(s). Configuring virtual display...`);
 
-        const updatedApps = this.sunshineConfig.addPrepCommandsToApps(
-          apps,
-          setupScriptPath,
-          teardownScriptPath,
-        );
+        const updatedApps = this.sunshineConfig.addPrepCommandsToApps(apps);
 
         await this.sunshineConfig.updateSunshineApps(
           this.vibeshineUsername,
@@ -207,7 +164,7 @@ export class ConnectionManager {
           updatedApps,
         );
 
-        this.output.appendLine('[Connect] Vibeshine apps updated with headless prep commands.');
+        this.output.appendLine('[Connect] Vibeshine apps configured for virtual display.');
 
         // Cache the apps so we can use them if the relay's listApps times out
         this.cachedVibeshineApps = apps.map((a: any) => ({

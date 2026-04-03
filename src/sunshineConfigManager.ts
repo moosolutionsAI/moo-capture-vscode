@@ -70,37 +70,24 @@ export class SunshineConfigManager {
    */
   addPrepCommandsToApps(
     apps: any[],
-    doScriptPath: string,
-    undoScriptPath: string,
   ): any[] {
-    const doCmd = `powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "${doScriptPath.replace(/\\/g, '\\\\')}"`;
-    const undoCmd = `powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File "${undoScriptPath.replace(/\\/g, '\\\\')}"`;
-
-    const mooPrepCmd = {
-      do: doCmd,
-      undo: undoCmd,
-      elevated: false,
-    };
-
     return apps.map((app) => {
       const updated = { ...app };
 
-      // Get existing prep-cmd array or create one
+      // Remove any existing Moo Capture prep-cmd entries — we no longer
+      // use setup.ps1/teardown.ps1 scripts because Vibeshine's native
+      // virtual display (virtual-screen=true) handles the display lifecycle.
+      // Keeping the old scripts causes monitor flickering on Windows 11 Home
+      // because pnputil commands fail and conflict with Vibeshine's display helper.
       const existingPrepCmds: any[] = Array.isArray(updated['prep-cmd'])
         ? [...updated['prep-cmd']]
         : [];
 
-      // Remove any existing Moo Capture prep-cmd entries (identified by
-      // the presence of our script filenames)
-      const filtered = existingPrepCmds.filter(
+      updated['prep-cmd'] = existingPrepCmds.filter(
         (cmd) =>
           !cmd.do?.includes('moo-capture') &&
           !cmd.do?.includes('setup.ps1'),
       );
-
-      // Add our prep-cmd at the beginning so it runs first
-      filtered.unshift(mooPrepCmd);
-      updated['prep-cmd'] = filtered;
 
       // Use Vibeshine's built-in virtual display instead of targeting a
       // specific physical display.  This tells Vibeshine to create and

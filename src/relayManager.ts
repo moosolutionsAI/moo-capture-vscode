@@ -112,11 +112,10 @@ export class RelayManager {
       streamer_path: './streamer',
       webrtc: {
         port_range: { min: 40000, max: 40010 },
-        ice_servers: [
-          { urls: ['stun:stun.l.google.com:19302'], username: '', credential: '' },
-        ],
-        network_types: ['udp4', 'udp6'],
+        ice_servers: [],
+        network_types: ['udp4'],
         include_loopback_candidates: true,
+        disabled: true,  // Force WebSocket transport — WebRTC ICE fails on localhost
       },
       moonlight: {
         default_http_port: 47989,

@@ -220,32 +220,11 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
-      // If headless mode, ensure VDD is installed and credentials are available
+      // If headless mode, get Vibeshine credentials for REST API.
+      // Vibeshine manages the virtual display via its built-in SudoVDA driver —
+      // no external VDD installation check needed.
       if (config.headlessMode) {
-        const vdm = new VirtualDisplayManager(output);
-        const installed = await vdm.isVddInstalled();
-
-        if (!installed) {
-          const choice = await vscode.window.showWarningMessage(
-            'Virtual Display Driver is not installed. Headless mode requires it.',
-            'Setup Now',
-            'Continue Without Headless',
-          );
-          if (choice === 'Setup Now') {
-            await vscode.commands.executeCommand('moo-capture.setupVirtualDisplay');
-            // Re-check after setup
-            const nowInstalled = await vdm.isVddInstalled();
-            if (!nowInstalled) {
-              vscode.window.showErrorMessage('VDD installation did not succeed. Continuing without headless mode.');
-              config.headlessMode = false;
-            }
-          } else {
-            config.headlessMode = false;
-          }
-        }
-
-        // Get Vibeshine credentials for REST API
-        if (config.headlessMode) {
+        {
           let creds = await getVibeshineCredentials(context.secrets);
           if (!creds) {
             creds = await promptAndStoreVibeshineCredentials(context.secrets);
@@ -460,7 +439,7 @@ function getWebviewContent(
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src http://127.0.0.1:* 'unsafe-inline'; frame-src http://127.0.0.1:*; script-src 'unsafe-inline' http://127.0.0.1:*; style-src 'unsafe-inline' http://127.0.0.1:*; connect-src ws://127.0.0.1:* http://127.0.0.1:*; media-src blob: mediastream: *; img-src http://127.0.0.1:* blob: data:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src http://127.0.0.1:* 'unsafe-inline' blob:; frame-src http://127.0.0.1:*; script-src 'unsafe-inline' 'wasm-unsafe-eval' http://127.0.0.1:* blob:; worker-src http://127.0.0.1:* blob:; style-src 'unsafe-inline' http://127.0.0.1:*; connect-src ws://127.0.0.1:* http://127.0.0.1:*; media-src blob: mediastream: *; img-src http://127.0.0.1:* blob: data:;">
   <style>
     html, body {
       margin: 0;
