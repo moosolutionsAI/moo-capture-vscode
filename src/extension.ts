@@ -840,6 +840,70 @@ function getWebviewContent(
         });
       }
 
+      // --- Iframe mute bridge installer ---
+      // Hoisted so patchIframe (defined immediately below) can call it.
+      // The bridge runs INSIDE the iframe's window context; we attach
+      // properties to iframeWin so the bridge survives across patchIframe
+      // calls (idempotent install via __mooMuteInstalled flag).
+      function installMuteBridge(iframeWin) {
+        if (!iframeWin || iframeWin.__mooMuteInstalled) { return; }
+        iframeWin.__mooMuteInstalled = true;
+
+        var doc = iframeWin.document;
+        // Track all GainNodes we inject between sources and AudioContext
+        // destinations. A Set tied to the iframe's window — GC'd when the
+        // iframe is replaced.
+        var masterGains = new Set();
+
+        // Monkey-patch AudioNode.prototype.connect so any source connecting
+        // to a destination is rerouted through a per-context master gain.
+        // The dominant path (AudioElementPlayer) does NOT use this; the
+        // bypass path (ContextDestinationNodeAudioPlayer) does.
+        if (iframeWin.AudioNode && iframeWin.AudioNode.prototype) {
+          var origConnect = iframeWin.AudioNode.prototype.connect;
+          iframeWin.AudioNode.prototype.connect = function(target) {
+            var rest = Array.prototype.slice.call(arguments, 1);
+            try {
+              if (
+                iframeWin.AudioDestinationNode &&
+                target instanceof iframeWin.AudioDestinationNode &&
+                !masterGains.has(this) &&
+                this.context && this.context.createGain
+              ) {
+                var gain = this.context.createGain();
+                masterGains.add(gain);
+                origConnect.call(gain, target);
+                return origConnect.apply(this, [gain].concat(rest));
+              }
+            } catch (_) { /* fall through to default behaviour */ }
+            return origConnect.apply(this, [target].concat(rest));
+          };
+        }
+
+        function setMute(muted) {
+          // (1) <audio>/<video> path
+          try {
+            doc.querySelectorAll('audio, video').forEach(function(el) {
+              try { el.muted = !!muted; } catch (_) {}
+            });
+          } catch (_) {}
+          // (2) Web Audio path
+          masterGains.forEach(function(g) {
+            try { g.gain.value = muted ? 0 : 1; } catch (_) {}
+          });
+        }
+
+        iframeWin.__mooSetMute = setMute;
+
+        // Listen for moo-set-mute coming from the outer webview
+        iframeWin.addEventListener('message', function(event) {
+          if (!event || !event.data) { return; }
+          if (event.data.type === 'moo-set-mute') {
+            setMute(!!event.data.muted);
+          }
+        });
+      }
+
       // --- Iframe patching ---
       if (iframe) {
         function patchIframe() {
@@ -859,6 +923,15 @@ function getWebviewContent(
             if (iframeWin.navigator && iframeWin.navigator.keyboard) {
               iframeWin.navigator.keyboard.lock = function() { return Promise.resolve(); };
             }
+
+            // Install mute bridge: lets the outer postMessage moo-set-mute
+            // actually mute the stream. Covers two pipelines —
+            // (1) AudioElementPlayer: el.muted via DOM walk
+            // (2) ContextDestinationNodeAudioPlayer (Web Audio bypass with
+            //     no <audio> element): master GainNode injected via
+            //     AudioNode.prototype.connect monkey-patch
+            // Idempotent — sets a flag on iframe window to avoid reinstall.
+            installMuteBridge(iframeWin);
 
             // Hide broken buttons in relay overlay
             setTimeout(function() {
