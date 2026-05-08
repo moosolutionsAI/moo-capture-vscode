@@ -297,31 +297,37 @@ export function activate(context: vscode.ExtensionContext): void {
           },
         );
 
-        panel.onDidDispose(async () => {
-          // Prompt the user for what to do on tab close
-          const choice = await vscode.window.showInformationMessage(
-            'Moo Capture tab closed. What would you like to do?',
-            'Keep Relay Running',
-            'Stop Stream',
-            'Shutdown Everything',
-          );
+        // Capture the Disposable so the listener is also tied to the
+        // extension lifetime. Auto-cleaned with panel.dispose(), but pushing
+        // to context.subscriptions prevents subtle leaks if the panel
+        // reference is ever lost without dispose firing.
+        context.subscriptions.push(
+          panel.onDidDispose(async () => {
+            // Prompt the user for what to do on tab close
+            const choice = await vscode.window.showInformationMessage(
+              'Moo Capture tab closed. What would you like to do?',
+              'Keep Relay Running',
+              'Stop Stream',
+              'Shutdown Everything',
+            );
 
-          if (choice === 'Shutdown Everything') {
-            connManager.dispose();
-            statusBar.text = STATE_LABELS.disconnected;
-            statusBar.tooltip = 'Relay stopped. Click to reconnect.';
-          } else if (choice === 'Stop Stream') {
-            connManager.disconnect();
-            statusBar.text = STATE_LABELS.disconnected;
-            statusBar.tooltip = 'Stream stopped. Relay still running for quick reconnect.';
-          } else {
-            // Keep Relay Running (or dismissed) — just cancel the active stream
-            connManager.disconnect();
-            statusBar.text = '$(game) Moo Capture (Ready)';
-            statusBar.tooltip = 'Relay running. Click to reconnect instantly.';
-          }
-          panel = undefined;
-        });
+            if (choice === 'Shutdown Everything') {
+              connManager.dispose();
+              statusBar.text = STATE_LABELS.disconnected;
+              statusBar.tooltip = 'Relay stopped. Click to reconnect.';
+            } else if (choice === 'Stop Stream') {
+              connManager.disconnect();
+              statusBar.text = STATE_LABELS.disconnected;
+              statusBar.tooltip = 'Stream stopped. Relay still running for quick reconnect.';
+            } else {
+              // Keep Relay Running (or dismissed) — just cancel the active stream
+              connManager.disconnect();
+              statusBar.text = '$(game) Moo Capture (Ready)';
+              statusBar.tooltip = 'Relay running. Click to reconnect instantly.';
+            }
+            panel = undefined;
+          }),
+        );
 
         // Show loading state while relay starts up
         panel.webview.html = getLoadingHtml();
@@ -357,18 +363,23 @@ export function activate(context: vscode.ExtensionContext): void {
         output.appendLine(`[Connect] ${apps.length} app(s) available. Showing in-stream launcher.`);
         panel.webview.html = getWebviewContent('', port, hostId, apps);
 
-        // Listen for app selection and mute-state updates from the webview
-        panel.webview.onDidReceiveMessage((msg: { command?: string; type?: string; appId?: number; appName?: string; muted?: boolean }) => {
-          if (msg.command === 'launchApp' && msg.appId !== undefined) {
-            const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${msg.appId}`;
-            output.appendLine(`[Connect] Launching ${msg.appName}: ${streamUrl}`);
-            if (panel) {
-              panel.webview.html = getWebviewContent(streamUrl, port, hostId, apps);
+        // Listen for app selection and mute-state updates from the webview.
+        // Captured Disposable goes to context.subscriptions so the listener
+        // is freed at extension deactivate even if the panel disposal is
+        // missed for any reason.
+        context.subscriptions.push(
+          panel.webview.onDidReceiveMessage((msg: { command?: string; type?: string; appId?: number; appName?: string; muted?: boolean }) => {
+            if (msg.command === 'launchApp' && msg.appId !== undefined) {
+              const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${msg.appId}`;
+              output.appendLine(`[Connect] Launching ${msg.appName}: ${streamUrl}`);
+              if (panel) {
+                panel.webview.html = getWebviewContent(streamUrl, port, hostId, apps);
+              }
+            } else if (msg.type === 'moo-mute' && typeof msg.muted === 'boolean') {
+              connManager.notifyMuteState(msg.muted);
             }
-          } else if (msg.type === 'moo-mute' && typeof msg.muted === 'boolean') {
-            connManager.notifyMuteState(msg.muted);
-          }
-        });
+          }),
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         output.appendLine(`[Connect] Failed: ${msg}`);
