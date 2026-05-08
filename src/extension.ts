@@ -697,13 +697,29 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Show Latency Stats command — opens a singleton webview that subscribes
   // to the latency monitor.
+  //
+  // Memory hygiene (iter 8 audit): per-panel cleanup state is held in a
+  // single slot `statsCleanup`. Each new panel disposes the prior slot's
+  // listener-disposable before installing a new one, so context.subscriptions
+  // does not accumulate idle entries across open/close cycles. The panel
+  // itself, the latency subscription, and the onDidDispose handler are all
+  // tied to this slot.
   let statsPanel: vscode.WebviewPanel | undefined;
+  let statsCleanup: vscode.Disposable | null = null;
+  context.subscriptions.push({
+    dispose: () => {
+      if (statsCleanup) { statsCleanup.dispose(); statsCleanup = null; }
+    },
+  });
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.showStats, () => {
       if (statsPanel) {
         statsPanel.reveal(vscode.ViewColumn.Beside);
         return;
       }
+      // Defensive: drop any prior cleanup before creating a new panel.
+      if (statsCleanup) { statsCleanup.dispose(); statsCleanup = null; }
+
       statsPanel = vscode.window.createWebviewPanel(
         'mooCaptureStats',
         'Moo Capture Stats',
@@ -715,12 +731,11 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!statsPanel) { return; }
         statsPanel.webview.postMessage({ type: 'moo-stats-update', snap });
       });
-      context.subscriptions.push(
-        statsPanel.onDidDispose(() => {
-          unsubscribe();
-          statsPanel = undefined;
-        }),
-      );
+      statsCleanup = statsPanel.onDidDispose(() => {
+        unsubscribe();
+        statsPanel = undefined;
+        statsCleanup = null;
+      });
     }),
   );
 
