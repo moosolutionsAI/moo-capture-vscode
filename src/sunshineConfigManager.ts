@@ -45,10 +45,17 @@ export class SunshineConfigManager {
     apps: any[],
   ): Promise<void> {
     for (const app of apps) {
-      // Sunshine expects numeric fields as actual numbers, not strings
-      const sanitized = { ...app };
-      if (typeof sanitized.index === 'string') {
-        sanitized.index = Number(sanitized.index);
+      // Sunshine expects numeric fields as actual numbers, not strings/null.
+      // The GET /api/apps response can include null for optional numeric
+      // fields, and nested prep-cmd entries can also have null sub-fields
+      // (do/undo/elevated) — any of these will make the POST fail with
+      // type_error.302. Strip recursively.
+      const sanitized = stripNullsDeep(app);
+      // Also normalize common numeric fields that arrive as strings.
+      for (const key of ['index', 'exit-timeout']) {
+        if (typeof sanitized[key] === 'string') {
+          sanitized[key] = Number(sanitized[key]);
+        }
       }
 
       const body = JSON.stringify(sanitized);
@@ -59,15 +66,30 @@ export class SunshineConfigManager {
   }
 
   /**
-   * Modifies each app in the array to add/update `prep-cmd` entries and the
-   * `output` field for headless virtual display streaming.
-   *
-   * - Adds (or replaces) a prep-cmd with the setup/teardown scripts.
-   * - Sets the `output` field to the virtual display name so Sunshine
-   *   captures from the correct monitor.
-   *
-   * @returns A new apps array with the modifications applied.
+   * Checks whether each app already has the correct virtual display config.
+   * If all apps are already configured, returns true (no POST needed).
    */
+  appsAlreadyConfigured(apps: any[]): boolean {
+    return apps.length > 0 && apps.every((app) => {
+      // Vibeshine can return virtual-screen as boolean true, string "true", or 1
+      const vs = app['virtual-screen'];
+      if (vs !== true && vs !== 'true' && vs !== 1) { return false; }
+      if (app['virtual-display-layout'] !== 'extended') { return false; }
+      // output could be undefined (missing key) or null — both are fine
+      if (app.output !== undefined && app.output !== null) { return false; }
+      // auto-detach must be explicitly false. When true (or unset, since
+      // Sunshine defaults to true), cursor crossing display boundaries
+      // causes Sunshine to attach a second session without tearing down
+      // the first — audio doubles until the older session drains.
+      if (app['auto-detach'] !== false) { return false; }
+      // Check for stale Moo Capture prep-cmd scripts
+      const cmds: any[] = Array.isArray(app['prep-cmd']) ? app['prep-cmd'] : [];
+      return !cmds.some(
+        (cmd) => cmd.do?.includes('moo-capture') || cmd.do?.includes('setup.ps1'),
+      );
+    });
+  }
+
   addPrepCommandsToApps(
     apps: any[],
   ): any[] {
@@ -96,6 +118,17 @@ export class SunshineConfigManager {
       updated['virtual-display-layout'] = 'extended';
       // Remove any stale output override — let Vibeshine manage the display
       delete updated.output;
+
+      // Force auto-detach false. With virtual-display-layout=extended,
+      // Sunshine's display helper re-preps when the cursor crosses between
+      // physical and virtual monitors. On apps with auto-detach=true (the
+      // Sunshine default) that re-prep attaches a second concurrent session
+      // without tearing the first down — audio doubles until the older
+      // session drains. Preserve an explicit user-set false; override true
+      // or unset.
+      if (updated['auto-detach'] !== false) {
+        updated['auto-detach'] = false;
+      }
 
       return updated;
     });
@@ -163,4 +196,20 @@ export class SunshineConfigManager {
       req.end();
     });
   }
+}
+
+function stripNullsDeep(value: any): any {
+  if (Array.isArray(value)) {
+    return value.map(stripNullsDeep);
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, any> = {};
+    for (const key of Object.keys(value)) {
+      const v = value[key];
+      if (v === null || v === undefined) { continue; }
+      out[key] = stripNullsDeep(v);
+    }
+    return out;
+  }
+  return value;
 }
