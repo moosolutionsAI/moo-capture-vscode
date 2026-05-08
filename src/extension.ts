@@ -601,6 +601,14 @@ export function activate(context: vscode.ExtensionContext): void {
   // subscribers somehow leaked.
   context.subscriptions.push({ dispose: stopLatencyWatching });
 
+  // Open Settings command — opens VS Code settings filtered to this
+  // extension's CONFIG_SECTION so all knobs are visible together.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(COMMANDS.openSettings, () => {
+      vscode.commands.executeCommand('workbench.action.openSettings', `@ext:MooKeyboardAI.moo-capture`);
+    }),
+  );
+
   // Show Latency Stats command — opens a singleton webview that subscribes
   // to the latency monitor.
   let statsPanel: vscode.WebviewPanel | undefined;

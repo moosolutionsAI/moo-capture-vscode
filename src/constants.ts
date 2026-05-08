@@ -48,6 +48,7 @@ export const COMMANDS = {
   setupVirtualDisplay: 'moo-capture.setupVirtualDisplay',
   toggleMute: 'moo-capture.toggleMute',
   showStats: 'moo-capture.showStats',
+  openSettings: 'moo-capture.openSettings',
 } as const;
 
 export const CONFIG_SECTION = 'mooCaptureVscode';
