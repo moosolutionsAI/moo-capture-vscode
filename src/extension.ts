@@ -598,8 +598,17 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   // Ensure the watcher is closed at extension deactivate even if all
-  // subscribers somehow leaked.
+  // subscribers somehow leaked. Also drop the status-bar latency
+  // subscription explicitly — it lives in an activate-scope closure
+  // (latencyUnsub) so registering its release here makes the intent
+  // explicit and survives any future refactor that breaks the watcher
+  // teardown chain.
   context.subscriptions.push({ dispose: stopLatencyWatching });
+  context.subscriptions.push({
+    dispose: () => {
+      if (latencyUnsub) { latencyUnsub(); latencyUnsub = null; }
+    },
+  });
 
   // Open Settings command — opens VS Code settings filtered to this
   // extension's CONFIG_SECTION so all knobs are visible together.
