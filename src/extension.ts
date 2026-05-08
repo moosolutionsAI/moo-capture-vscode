@@ -659,8 +659,29 @@ export function activate(context: vscode.ExtensionContext): void {
         await cfg.update('bitrate', 20000, target);
         await cfg.update('resolution', '2560x1440', target);
       }
+      const presetName = choice.label.replace(/^\$\([^)]+\)\s*/, '');
+
+      // If currently streaming, the preset values do not take effect until
+      // the next connect. Prompt the user explicitly — never auto-reconnect.
+      // Disconnect leaves the relay running so the next connect is fast.
+      if (connManager.currentState === 'streaming') {
+        const action = await vscode.window.showWarningMessage(
+          `Moo Capture: ${presetName} preset saved. The new settings only apply on the next connect. Reconnect now?`,
+          { modal: true },
+          'Reconnect',
+          'Later',
+        );
+        if (action === 'Reconnect') {
+          await vscode.commands.executeCommand(COMMANDS.disconnect);
+          // User initiates the new connect themselves to keep the action
+          // explicit — we never auto-fire connect here. The disconnect path
+          // already updates the status bar to "Ready, click to reconnect".
+        }
+        return;
+      }
+
       vscode.window.showInformationMessage(
-        `Moo Capture: applied ${choice.label.replace(/^\$\([^)]+\)\s*/, '')} preset. Reconnect to take effect.`,
+        `Moo Capture: ${presetName} preset saved. Connect to apply.`,
       );
     }),
   );
