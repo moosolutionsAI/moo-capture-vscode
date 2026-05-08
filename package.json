@@ -22,7 +22,8 @@
     "onCommand:moo-capture.setupVirtualDisplay",
     "onCommand:moo-capture.toggleMute",
     "onCommand:moo-capture.showStats",
-    "onCommand:moo-capture.openSettings"
+    "onCommand:moo-capture.openSettings",
+    "onCommand:moo-capture.tuneStream"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -66,6 +67,12 @@
         "command": "moo-capture.openSettings",
         "title": "Open Settings",
         "icon": "$(settings-gear)",
+        "category": "Moo Capture"
+      },
+      {
+        "command": "moo-capture.tuneStream",
+        "title": "Tune Stream (Game / Quality / Custom)",
+        "icon": "$(rocket)",
         "category": "Moo Capture"
       }
     ],

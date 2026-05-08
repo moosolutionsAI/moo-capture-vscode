@@ -609,6 +609,62 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  // Tune Stream — quick-pick preset selector for the latency-relevant
+  // settings. Game Mode picks the lowest-latency combo, Quality Mode picks
+  // the highest-fidelity combo, Custom hands off to openSettings.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(COMMANDS.tuneStream, async () => {
+      type PresetId = 'game' | 'quality' | 'custom';
+      interface Preset extends vscode.QuickPickItem {
+        id: PresetId;
+      }
+      const items: Preset[] = [
+        {
+          id: 'game',
+          label: '$(rocket) Game Mode',
+          description: 'h264 / 60 fps / 30000 Kbps / 1920x1080',
+          detail: 'Lowest latency. Best for action games.',
+        },
+        {
+          id: 'quality',
+          label: '$(symbol-color) Quality Mode',
+          description: 'hevc / 60 fps / 20000 Kbps / 2560x1440',
+          detail: 'Highest fidelity. Best for slow / desktop content.',
+        },
+        {
+          id: 'custom',
+          label: '$(settings-gear) Custom',
+          description: 'Open the full settings UI',
+        },
+      ];
+      const choice = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select a streaming preset',
+        ignoreFocusOut: false,
+      });
+      if (!choice) { return; }
+      if (choice.id === 'custom') {
+        await vscode.commands.executeCommand(COMMANDS.openSettings);
+        return;
+      }
+      const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
+      const target = vscode.ConfigurationTarget.Global;
+      if (choice.id === 'game') {
+        await cfg.update('codec', 'h264', target);
+        await cfg.update('fps', 60, target);
+        await cfg.update('bitrate', 30000, target);
+        await cfg.update('resolution', '1920x1080', target);
+      } else if (choice.id === 'quality') {
+        await cfg.update('codec', 'hevc', target);
+        await cfg.update('fps', 60, target);
+        await cfg.update('bitrate', 20000, target);
+        await cfg.update('resolution', '2560x1440', target);
+      }
+      vscode.window.showInformationMessage(
+        `Moo Capture: applied ${choice.label.replace(/^\$\([^)]+\)\s*/, '')} preset. Reconnect to take effect.`,
+      );
+    }),
+  );
+
   // Show Latency Stats command — opens a singleton webview that subscribes
   // to the latency monitor.
   let statsPanel: vscode.WebviewPanel | undefined;

@@ -49,6 +49,7 @@ export const COMMANDS = {
   toggleMute: 'moo-capture.toggleMute',
   showStats: 'moo-capture.showStats',
   openSettings: 'moo-capture.openSettings',
+  tuneStream: 'moo-capture.tuneStream',
 } as const;
 
 export const CONFIG_SECTION = 'mooCaptureVscode';
