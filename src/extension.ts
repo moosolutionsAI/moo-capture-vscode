@@ -755,32 +755,36 @@ function getWebviewContent(
       // --- Mute toggle ---
       const muteBtn = document.getElementById('mute-btn');
       if (muteBtn) {
+        // Sender tokens guard against future echo loops. Each side stamps
+        // outgoing messages with its origin and skips messages whose sender
+        // matches itself. Cheap defensive infrastructure.
+        const SENDER_OUTER = 'moo-outer';
+        const SENDER_IFRAME = 'moo-iframe';
         // Initial state mirrors the audio element's actual post-interaction
         // state. The relay creates the audio element muted=true but force-
         // unmutes via onUserInteraction on the first click/keypress that
         // reaches the stream. By the time the user can see and click this
         // toolbar button, audio is audible — so muted=false is correct, and
         // a first click correctly mutes (instead of being a no-op that just
-        // flipped the label). Iteration 8 will replace this assumption with
-        // a live query into the iframe.
+        // flipped the label). Iteration 8 replaces this assumption with a
+        // live query into the iframe.
         let muted = false;
         muteBtn.classList.toggle('active', !muted);
         function publishMuteState() {
           // Forward to the extension so the status-bar mute icon stays in sync.
           vscode.postMessage({ type: 'moo-mute', muted: muted });
         }
-        // Tell the extension the initial assumed state so the status-bar
-        // icon does not display $(unmute) while the button says "Mute"
-        // (which would imply audio is currently audible and pressing mutes).
         publishMuteState();
         muteBtn.addEventListener('click', function() {
           muted = !muted;
           muteBtn.textContent = muted ? 'Unmute' : 'Mute';
           muteBtn.classList.toggle('active', !muted);
-          // Send mute command to iframe via postMessage (cross-origin safe)
           var frame = document.getElementById('streamFrame');
           if (frame) {
-            frame.contentWindow.postMessage({ type: 'moo-set-mute', muted: muted }, '*');
+            frame.contentWindow.postMessage(
+              { type: 'moo-set-mute', muted: muted, sender: SENDER_OUTER },
+              '*',
+            );
           }
           publishMuteState();
         });
@@ -788,6 +792,10 @@ function getWebviewContent(
         // and toggle requests from the extension (ctrl+shift+m keybinding).
         window.addEventListener('message', function(event) {
           if (!event.data) { return; }
+          // Reject messages that originated from this same outer context.
+          // VS Code's vscode.postMessage does not echo to its own webview,
+          // but a future code path could add an echo — drop it pre-emptively.
+          if (event.data.sender === SENDER_OUTER) { return; }
           if (event.data.type === 'moo-mute') {
             muted = event.data.muted;
             muteBtn.textContent = muted ? 'Unmute' : 'Mute';
@@ -798,6 +806,9 @@ function getWebviewContent(
             // postMessage and label sync stay on a single path.
             muteBtn.click();
           }
+          // Suppress unused warning; SENDER_IFRAME is used by symmetry/docs
+          // but the outer never SENDS as iframe — the iframe stamps its own.
+          void SENDER_IFRAME;
         });
       }
 
@@ -906,9 +917,14 @@ function getWebviewContent(
 
         iframeWin.__mooSetMute = setMute;
 
-        // Listen for moo-set-mute coming from the outer webview
+        var SENDER_IFRAME = 'moo-iframe';
+        // Listen for moo-set-mute coming from the outer webview. Reject any
+        // message that the iframe itself sent (defensive against future
+        // self-echo paths via window.postMessage(..., '*') landing back in
+        // the same window).
         iframeWin.addEventListener('message', function(event) {
           if (!event || !event.data) { return; }
+          if (event.data.sender === SENDER_IFRAME) { return; }
           if (event.data.type === 'moo-set-mute') {
             setMute(!!event.data.muted);
           }

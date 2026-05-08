@@ -24,6 +24,10 @@ export class ConnectionManager {
   // iteration 1's auto-detach=false fix not taking effect.
   private hostStreamAbort: AbortController | null = null;
   private guardCancelInFlight = false;
+  // Iteration 10: one-shot fire per session. If the guard fires once and
+  // the doubling persists (cancel did not help), do not keep firing
+  // cancelStream in a loop — log and let the user reconnect.
+  private guardFired = false;
 
   private sunshineConfig: SunshineConfigManager | null = null;
 
@@ -385,6 +389,7 @@ export class ConnectionManager {
 
     const abort = new AbortController();
     this.hostStreamAbort = abort;
+    this.guardFired = false;
 
     this.apiClient.streamHostUpdates(
       abort.signal,
@@ -406,9 +411,17 @@ export class ConnectionManager {
         }
         if (count === null || count <= 1) { return; }
         if (this.guardCancelInFlight) { return; }
+        if (this.guardFired) {
+          // Already fired once this session and doubling persists. Logging
+          // every SSE tick would be noisy; one warning is enough until the
+          // user reconnects (which calls startSessionGuard and resets the
+          // flag).
+          return;
+        }
         if (abort.signal.aborted) { return; }
 
         this.guardCancelInFlight = true;
+        this.guardFired = true;
         this.output.appendLine(
           `[SessionGuard] active sessions=${count} on host ${hostId} — cancelling to prevent audio doubling`,
         );
@@ -421,9 +434,10 @@ export class ConnectionManager {
             this.output.appendLine(`[SessionGuard] cancelStream failed: ${msg}`);
           })
           .finally(() => {
-            // Reset so a fresh connect can re-arm the guard. The SSE handler
-            // itself will see count drop and not re-fire because the gate
-            // only fires once before the manager is disconnected.
+            // Allow a future connect to re-arm via startSessionGuard.
+            // guardFired stays true so the SSE handler will not refire
+            // within this session even if cancelStream did not clear the
+            // doubling.
             this.guardCancelInFlight = false;
           });
       },
@@ -440,6 +454,7 @@ export class ConnectionManager {
       this.hostStreamAbort = null;
     }
     this.guardCancelInFlight = false;
+    this.guardFired = false;
   }
 
   dispose(): void {
