@@ -504,13 +504,25 @@ export function activate(context: vscode.ExtensionContext): void {
   // ---------------------------------------------------------------------------
   // Latency monitor — shared fs.watch driver
   //
-  // Iteration 1 (and shared with iteration 2's status-bar latency item):
-  // a single fs.watch on the Sunshine log directory drives any number of
-  // subscribers. The watcher is reference-counted: it starts on first
-  // subscriber, stops on last unsubscribe. Debounce is a single setTimeout
-  // slot replaced via clearTimeout so log-write bursts cannot accumulate
-  // pending callbacks. fs.watch handle is tracked on a single owner and
-  // closed by the same dispose path.
+  // Iter 1 (Stats panel) and iter 2 (status-bar item) both subscribe via
+  // subscribeLatency. Iter 3 audited the lifecycle and documents the
+  // invariants here.
+  //
+  // Invariants (must hold across all paths):
+  //   - exactly one fs.FSWatcher exists at a time, on `latencyWatcher`
+  //   - exactly one debounce setTimeout exists at a time, on `latencyDebounce`
+  //   - `stopLatencyWatching` is idempotent and closes both
+  //   - `ensureLatencyWatching` returns early if a watcher exists, never
+  //     accumulates
+  //   - `latencySubs` is the only fanout target; entries are cleared on
+  //     unsubscribe
+  //   - watcher is closed via TWO dispose paths: last-unsubscribe and
+  //     extension deactivate; both call stopLatencyWatching which is safe
+  //     to call repeatedly
+  //   - log file is read-only; the watcher cannot trigger a write that
+  //     re-fires itself
+  //   - fanOutLatency snapshots the subscriber Set before iterating so a
+  //     callback that unsubscribes during fanout does not desync iteration
   // ---------------------------------------------------------------------------
   type LatencySub = (snapshot: LatencySnapshot) => void;
   const latencySubs = new Set<LatencySub>();
@@ -520,7 +532,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function fanOutLatency(): void {
     lastLatencySnapshot = readLatencySnapshot(SUNSHINE_LOG_DIR);
-    for (const sub of latencySubs) {
+    // Snapshot subscribers before iterating: a callback that unsubscribes
+    // during fanout (e.g., disconnect during a status-bar update) must not
+    // desync iteration.
+    const subs = Array.from(latencySubs);
+    for (const sub of subs) {
       try { sub(lastLatencySnapshot); } catch { /* never let a bad sub break others */ }
     }
   }
