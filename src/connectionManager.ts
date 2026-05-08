@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import type { OutputChannel } from 'vscode';
 import { RelayManager } from './relayManager';
 import { RelayDownloader } from './relayDownloader';
@@ -53,6 +55,31 @@ export class ConnectionManager {
     onNeedPairPin: (pin: string) => void,
   ): Promise<{ port: number; hostId: number; apps: import('./types').RelayApp[] }> {
     try {
+      // Defensive teardown: if a prior session is still recorded (disconnect
+      // was skipped, onDidDispose missed, or the prior cancelStream silently
+      // failed), cancel it on the existing relay before we replace apiClient.
+      // Fire-and-forget — never block the new connect on the old session's
+      // cleanup, but make sure the request is dispatched before lastHostId
+      // is cleared. Skip if the relay is already stopped (prior session is
+      // orphaned at the Sunshine layer; new relay can't reach it).
+      if (this.apiClient && this.lastHostId !== null && this.relay.isRunning) {
+        const staleHostId = this.lastHostId;
+        this.apiClient.cancelStream(staleHostId).catch(() => { /* expected on stale state */ });
+        this.output.appendLine(`[Connect] Defensive teardown: cancelStream(${staleHostId})`);
+      }
+
+      // Reset per-connect cache so a prior failed attempt doesn't feed us stale
+      // apps on retry.
+      this.cachedVibeshineApps = [];
+      this.lastHostId = null;
+
+      // Remove zombie hosts from the relay's data.json before the relay reads
+      // it. Hosts whose address resolves off-loopback (e.g. "localhost" via
+      // DNS) trigger Moonlight's "remote IPv4 streaming" path. If two hosts
+      // are stored (one good, one stale), the /api/hosts listing order is
+      // non-deterministic and we may pick the wrong one.
+      this.cleanZombieHosts(config.sunshineHost);
+
       let port = config.relayPort || RELAY_DEFAULT_PORT;
 
       // Step 1: Ensure relay binary exists
@@ -140,6 +167,40 @@ export class ConnectionManager {
   }
 
   // -------------------------------------------------------------------------
+  // Zombie host cleanup — removes stale "localhost" / wrong-address entries
+  // from the relay's data.json so listHosts returns only our canonical host.
+  // -------------------------------------------------------------------------
+
+  private cleanZombieHosts(canonicalAddress: string): void {
+    const dataJsonPath = path.join(this.globalStoragePath, 'server', 'data.json');
+    if (!fs.existsSync(dataJsonPath)) { return; }
+
+    try {
+      const raw = fs.readFileSync(dataJsonPath, 'utf8');
+      const data = JSON.parse(raw);
+      if (!data.hosts || typeof data.hosts !== 'object') { return; }
+
+      const beforeIds = Object.keys(data.hosts);
+      const removed: string[] = [];
+      for (const id of beforeIds) {
+        const addr = data.hosts[id]?.address;
+        if (addr !== canonicalAddress) {
+          removed.push(`${id}(address=${addr})`);
+          delete data.hosts[id];
+        }
+      }
+
+      if (removed.length > 0) {
+        fs.writeFileSync(dataJsonPath, JSON.stringify(data, null, 2));
+        this.output.appendLine(`[Clean] Removed ${removed.length} zombie host(s): ${removed.join(', ')}`);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[Clean] Failed to clean zombie hosts (non-fatal): ${msg}`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Headless virtual display setup
   // -------------------------------------------------------------------------
 
@@ -158,18 +219,25 @@ export class ConnectionManager {
           this.vibeshinePassword,
         );
 
-        this.output.appendLine(`[Connect] Found ${apps.length} Vibeshine app(s). Configuring virtual display...`);
+        this.output.appendLine(`[Connect] Found ${apps.length} Vibeshine app(s). Checking virtual display config...`);
 
-        const updatedApps = this.sunshineConfig.addPrepCommandsToApps(apps);
+        // Skip the POST if apps already have the correct virtual display
+        // config. Unnecessary POSTs trigger Windows display topology changes
+        // that cause black screen flicker and can duplicate virtual displays.
+        if (this.sunshineConfig.appsAlreadyConfigured(apps)) {
+          this.output.appendLine('[Connect] Vibeshine apps already configured — skipping update to avoid display flicker.');
+        } else {
+          const updatedApps = this.sunshineConfig.addPrepCommandsToApps(apps);
 
-        await this.sunshineConfig.updateSunshineApps(
-          this.vibeshineUsername,
-          this.vibeshinePassword,
-          env,
-          updatedApps,
-        );
+          await this.sunshineConfig.updateSunshineApps(
+            this.vibeshineUsername,
+            this.vibeshinePassword,
+            env,
+            updatedApps,
+          );
 
-        this.output.appendLine('[Connect] Vibeshine apps configured for virtual display.');
+          this.output.appendLine('[Connect] Vibeshine apps configured for virtual display.');
+        }
 
         // Cache the apps so we can use them if the relay's listApps times out
         this.cachedVibeshineApps = apps.map((a: any) => ({
@@ -201,40 +269,54 @@ export class ConnectionManager {
   ): Promise<RelayHost> {
     if (!this.apiClient) { throw new Error('Not logged in'); }
 
-    // List existing hosts — deduplicate by host_id (the relay's SSE stream
-    // can return the same host multiple times)
+    // Always call addHost for our configured address. The relay derives
+    // host_id from the address, so this is idempotent: a stale "localhost"
+    // host from a previous run gets a different id than our "127.0.0.1"
+    // entry, and we must use the id that matches our address — otherwise
+    // Moonlight resolves "localhost" via DNS, lands on a non-loopback
+    // interface, and applies the "remote IPv4 streaming" 1024-byte MTU cap
+    // that makes the stream die 1s after the first video packet.
+    let authoritativeHost: RelayHost | null = null;
+    this.output.appendLine(`[Connect] Adding host: ${config.sunshineHost}:${config.sunshinePort}`);
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        authoritativeHost = await this.apiClient.addHost(config.sunshineHost, config.sunshinePort);
+        this.output.appendLine(`[Connect] addHost returned id=${authoritativeHost.host_id} paired=${authoritativeHost.paired}`);
+        break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (attempt < 3 && msg.includes('IncompleteMessage')) {
+          this.output.appendLine(`[Connect] addHost attempt ${attempt} failed (IncompleteMessage), retrying in 1s...`);
+          await new Promise(r => setTimeout(r, 1000));
+        } else {
+          this.output.appendLine(`[Connect] addHost failed — falling back to listHosts: ${msg}`);
+          break;
+        }
+      }
+    }
+
+    // List hosts to dedupe and get live pairing state — addHost's response
+    // may not reflect current server_state.
     const rawHosts = await this.apiClient.listHosts();
     const seen = new Set<number>();
     const hosts = rawHosts.filter(h => {
-      if (seen.has(h.host_id)) { return false; }
-      seen.add(h.host_id);
+      const id = Number(h.host_id);
+      if (seen.has(id)) { return false; }
+      seen.add(id);
       return true;
     });
     this.output.appendLine(`[Connect] Found ${hosts.length} host(s): ${JSON.stringify(hosts.map(h => ({ id: h.host_id, name: h.name, paired: h.paired })))}`);
 
-    let host = hosts.length > 0 ? hosts[0] : null;
-
-    if (!host) {
-      // No hosts at all — add one (retry up to 3 times; Vibeshine may drop
-      // the first connection before the response is fully read)
-      this.output.appendLine(`[Connect] Adding host: ${config.sunshineHost}:${config.sunshinePort}`);
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          host = await this.apiClient.addHost(config.sunshineHost, config.sunshinePort);
-          this.output.appendLine(`[Connect] Host added: ${host.name} (id=${host.host_id}, paired=${host.paired})`);
-          break;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (attempt < 3 && msg.includes('IncompleteMessage')) {
-            this.output.appendLine(`[Connect] addHost attempt ${attempt} failed (IncompleteMessage), retrying in 1s...`);
-            await new Promise(r => setTimeout(r, 1000));
-          } else {
-            throw err;
-          }
-        }
-      }
-      if (!host) { throw new Error('Failed to add host after 3 attempts'); }
+    // Prefer the host id returned by addHost (matches our address exactly);
+    // fall back to the first listed host only if addHost failed entirely.
+    let host: RelayHost | null = null;
+    if (authoritativeHost) {
+      host = hosts.find(h => Number(h.host_id) === Number(authoritativeHost!.host_id)) ?? authoritativeHost;
+    } else if (hosts.length > 0) {
+      host = hosts[0];
     }
+
+    if (!host) { throw new Error('Failed to add host after 3 attempts'); }
 
     // Pair if needed
     if (host.paired === 'NotPaired') {
