@@ -202,6 +202,21 @@ export function activate(context: vscode.ExtensionContext): void {
   muteStatusBar.tooltip = 'Stream audio (click to mute, Ctrl+Shift+M)';
   context.subscriptions.push(muteStatusBar);
 
+  // Latency status-bar item — visible only while streaming. Sourced from
+  // the same fs.watch driver used by the Show Stats panel (subscribeLatency
+  // below). Click opens the full Stats webview.
+  const latencyStatusBar = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    STATUS_BAR_PRIORITY - 2,
+  );
+  latencyStatusBar.command = COMMANDS.showStats;
+  latencyStatusBar.text = '$(pulse) --/-- ms';
+  latencyStatusBar.tooltip = 'Stream latency (click for Stats)';
+  context.subscriptions.push(latencyStatusBar);
+  // Subscription handle tied to the streaming session — populated when
+  // entering streaming state, released when leaving.
+  let latencyUnsub: (() => void) | null = null;
+
   // Render the icon based on mute state. Updated by webview messages.
   let muteState: boolean | null = null;
   const renderMuteStatusBar = (): void => {
@@ -231,11 +246,33 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     if (state === 'streaming') {
       muteStatusBar.show();
+      // Subscribe to the latency monitor only while streaming. Watcher is
+      // reference-counted; this is the only consumer when no Stats panel
+      // is open. Single-slot guard prevents double-subscribing on any
+      // future onState re-entry.
+      if (!latencyUnsub) {
+        latencyUnsub = subscribeLatency((snap) => {
+          const enc = snap.frameProcessingMs && typeof snap.frameProcessingMs.avg === 'number'
+            ? snap.frameProcessingMs.avg.toFixed(1)
+            : '--';
+          const net = snap.networkMs && typeof snap.networkMs.avg === 'number'
+            ? snap.networkMs.avg.toFixed(1)
+            : '--';
+          latencyStatusBar.text = `$(pulse) ${enc}/${net} ms`;
+          latencyStatusBar.tooltip = `Encode ${enc} ms / Network ${net} ms (click for full Stats)`;
+        });
+      }
+      latencyStatusBar.show();
     } else {
       muteStatusBar.hide();
       // Reset for next session so the icon does not flash a stale state.
       muteState = null;
       renderMuteStatusBar();
+      // Drop the latency subscription so the watcher can stop if no Stats
+      // panel is also subscribed.
+      if (latencyUnsub) { latencyUnsub(); latencyUnsub = null; }
+      latencyStatusBar.text = '$(pulse) --/-- ms';
+      latencyStatusBar.hide();
     }
   });
 
