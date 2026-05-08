@@ -665,7 +665,7 @@ function getWebviewContent(
   <div id="toolbar" ${isStreaming ? '' : 'style="display:none"'}>
     <button class="tb-btn" id="apps-btn" title="Switch app">Apps</button>
     <button class="tb-btn" id="toggle-btn" title="Toggle view-only mode">Interactive</button>
-    <button class="tb-btn" id="mute-btn" title="Toggle audio">Unmute</button>
+    <button class="tb-btn" id="mute-btn" title="Toggle audio (Ctrl+Shift+M)">Mute</button>
   </div>
 
   <div id="app-picker"></div>
@@ -744,11 +744,24 @@ function getWebviewContent(
       // --- Mute toggle ---
       const muteBtn = document.getElementById('mute-btn');
       if (muteBtn) {
-        let muted = true;
+        // Initial state mirrors the audio element's actual post-interaction
+        // state. The relay creates the audio element muted=true but force-
+        // unmutes via onUserInteraction on the first click/keypress that
+        // reaches the stream. By the time the user can see and click this
+        // toolbar button, audio is audible — so muted=false is correct, and
+        // a first click correctly mutes (instead of being a no-op that just
+        // flipped the label). Iteration 8 will replace this assumption with
+        // a live query into the iframe.
+        let muted = false;
+        muteBtn.classList.toggle('active', !muted);
         function publishMuteState() {
           // Forward to the extension so the status-bar mute icon stays in sync.
           vscode.postMessage({ type: 'moo-mute', muted: muted });
         }
+        // Tell the extension the initial assumed state so the status-bar
+        // icon does not display $(unmute) while the button says "Mute"
+        // (which would imply audio is currently audible and pressing mutes).
+        publishMuteState();
         muteBtn.addEventListener('click', function() {
           muted = !muted;
           muteBtn.textContent = muted ? 'Unmute' : 'Mute';
