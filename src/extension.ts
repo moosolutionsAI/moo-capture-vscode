@@ -512,7 +512,9 @@ function getWebviewContent(
     }
     #exit-overlay.hidden { display: none; }
 
-    /* Toolbar — appears on hover */
+    /* Toolbar — visible on load, on pointer movement, and while .visible class is set.
+       Once the iframe takes pointer focus, body:hover stops firing reliably,
+       so we drive visibility from JS pointer events on the panel. */
     #toolbar {
       position: fixed;
       top: 8px;
@@ -522,8 +524,13 @@ function getWebviewContent(
       gap: 6px;
       opacity: 0;
       transition: opacity 0.2s;
+      pointer-events: none;
     }
-    body:hover #toolbar { opacity: 1; }
+    body:hover #toolbar,
+    #toolbar.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
     .tb-btn {
       background: rgba(30,30,46,0.9);
       color: #cdd6f4;
@@ -730,6 +737,43 @@ function getWebviewContent(
           iframe.classList.toggle('view-only', viewOnly);
           toggleBtn.classList.toggle('active', viewOnly);
           toggleBtn.textContent = viewOnly ? 'View Only' : 'Interactive';
+        });
+      }
+
+      // --- Toolbar persistence ---
+      // Once the iframe captures pointer focus, body:hover stops firing
+      // reliably. Drive visibility from JS pointer events so the toolbar
+      // is discoverable: 4s on initial load, 2s on pointer movement or
+      // when the cursor crosses into the iframe. Mouse over toolbar
+      // itself keeps it visible until exit.
+      const toolbar = document.getElementById('toolbar');
+      if (toolbar) {
+        let hideTimer = null;
+        function showToolbar(holdMs) {
+          toolbar.classList.add('visible');
+          if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+          hideTimer = setTimeout(function() {
+            toolbar.classList.remove('visible');
+            hideTimer = null;
+          }, holdMs);
+        }
+        // Initial hint so the user can find the controls
+        showToolbar(4000);
+        // Outer-document pointer movement (rare while iframe has focus,
+        // but covers the gap between webview load and iframe focus).
+        document.addEventListener('pointermove', function() { showToolbar(2000); });
+        // mouseenter fires on the iframe element from the parent context
+        // every time the cursor crosses into the iframe — solid signal.
+        if (iframe) {
+          iframe.addEventListener('mouseenter', function() { showToolbar(2000); });
+        }
+        // Hold visible while cursor is on the toolbar itself.
+        toolbar.addEventListener('mouseenter', function() {
+          if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+          toolbar.classList.add('visible');
+        });
+        toolbar.addEventListener('mouseleave', function() {
+          showToolbar(2000);
         });
       }
 
