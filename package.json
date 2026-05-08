@@ -20,7 +20,8 @@
     "onCommand:moo-capture.disconnect",
     "onCommand:moo-capture.shutdown",
     "onCommand:moo-capture.setupVirtualDisplay",
-    "onCommand:moo-capture.toggleMute"
+    "onCommand:moo-capture.toggleMute",
+    "onCommand:moo-capture.showStats"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -52,6 +53,12 @@
         "command": "moo-capture.toggleMute",
         "title": "Toggle Stream Audio Mute",
         "icon": "$(mute)",
+        "category": "Moo Capture"
+      },
+      {
+        "command": "moo-capture.showStats",
+        "title": "Show Latency Stats",
+        "icon": "$(pulse)",
         "category": "Moo Capture"
       }
     ],

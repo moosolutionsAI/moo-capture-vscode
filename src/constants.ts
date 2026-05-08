@@ -47,6 +47,7 @@ export const COMMANDS = {
   shutdown: 'moo-capture.shutdown',
   setupVirtualDisplay: 'moo-capture.setupVirtualDisplay',
   toggleMute: 'moo-capture.toggleMute',
+  showStats: 'moo-capture.showStats',
 } as const;
 
 export const CONFIG_SECTION = 'mooCaptureVscode';
@@ -62,6 +63,8 @@ export const VDD_DEVICE_NAME = 'Virtual Display Driver';
 /** Vibeshine installs to the Sunshine directory for backward compatibility */
 export const VIBESHINE_INSTALL_DIR = 'C:\\Program Files\\Sunshine';
 export const VIBESHINE_DXGI_INFO = 'C:\\Program Files\\Sunshine\\tools\\dxgi-info.exe';
+/** Where Sunshine writes its rolling debug logs (sunshine-YYYYMMDD-...log) */
+export const SUNSHINE_LOG_DIR = 'C:\\Program Files\\Sunshine\\config\\logs';
 export const VIBESHINE_API_PORT = 47990;
 /** Process name that the watchdog monitors (Vibeshine keeps 'sunshine' for compat) */
 export const STREAMER_PROCESS_NAME = 'sunshine';

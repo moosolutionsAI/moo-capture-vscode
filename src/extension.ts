@@ -1,9 +1,10 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { COMMANDS, CONFIG_SECTION, STATUS_BAR_PRIORITY, RELAY_DEFAULT_PORT } from './constants';
+import { COMMANDS, CONFIG_SECTION, STATUS_BAR_PRIORITY, RELAY_DEFAULT_PORT, SUNSHINE_LOG_DIR } from './constants';
 import { ConnectionManager } from './connectionManager';
 import { VirtualDisplayManager } from './virtualDisplayManager';
+import { readLatencySnapshot, type LatencySnapshot, EMPTY_SNAPSHOT } from './sunshineLogReader';
 import type { MooCaptureConfig, ConnectionState } from './types';
 
 // ---------------------------------------------------------------------------
@@ -460,6 +461,119 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       panel.webview.postMessage({ type: 'moo-toggle-mute' });
+    }),
+  );
+
+  // ---------------------------------------------------------------------------
+  // Latency monitor — shared fs.watch driver
+  //
+  // Iteration 1 (and shared with iteration 2's status-bar latency item):
+  // a single fs.watch on the Sunshine log directory drives any number of
+  // subscribers. The watcher is reference-counted: it starts on first
+  // subscriber, stops on last unsubscribe. Debounce is a single setTimeout
+  // slot replaced via clearTimeout so log-write bursts cannot accumulate
+  // pending callbacks. fs.watch handle is tracked on a single owner and
+  // closed by the same dispose path.
+  // ---------------------------------------------------------------------------
+  type LatencySub = (snapshot: LatencySnapshot) => void;
+  const latencySubs = new Set<LatencySub>();
+  let latencyWatcher: fs.FSWatcher | null = null;
+  let latencyDebounce: NodeJS.Timeout | null = null;
+  let lastLatencySnapshot: LatencySnapshot = EMPTY_SNAPSHOT;
+
+  function fanOutLatency(): void {
+    lastLatencySnapshot = readLatencySnapshot(SUNSHINE_LOG_DIR);
+    for (const sub of latencySubs) {
+      try { sub(lastLatencySnapshot); } catch { /* never let a bad sub break others */ }
+    }
+  }
+
+  function ensureLatencyWatching(): void {
+    if (latencyWatcher) { return; }
+    if (!fs.existsSync(SUNSHINE_LOG_DIR)) {
+      // No logs dir yet — emit one snapshot so subscribers see the empty
+      // state, but skip the watcher (fs.watch on a missing path throws).
+      fanOutLatency();
+      return;
+    }
+    try {
+      latencyWatcher = fs.watch(SUNSHINE_LOG_DIR, { persistent: false }, (_event, filename) => {
+        // Filter to sunshine-*.log writes only; ignore unrelated activity.
+        if (filename && !/^sunshine-.*\.log$/i.test(String(filename))) { return; }
+        // Debounce: each event clears the prior timer and sets a fresh
+        // one. Single slot — never accumulates.
+        if (latencyDebounce) { clearTimeout(latencyDebounce); }
+        latencyDebounce = setTimeout(() => {
+          latencyDebounce = null;
+          fanOutLatency();
+        }, 500);
+      });
+      latencyWatcher.on('error', (err) => {
+        output.appendLine(`[LatencyMonitor] watcher error (non-fatal): ${err.message}`);
+      });
+      // Initial snapshot so subscribers don't sit blank waiting for the
+      // next 20s log tick.
+      fanOutLatency();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      output.appendLine(`[LatencyMonitor] could not start watcher: ${msg}`);
+      // Still fan out a single snapshot so subscribers can render an
+      // error state.
+      fanOutLatency();
+    }
+  }
+
+  function stopLatencyWatching(): void {
+    if (latencyDebounce) { clearTimeout(latencyDebounce); latencyDebounce = null; }
+    if (latencyWatcher) {
+      try { latencyWatcher.close(); } catch { /* ignore */ }
+      latencyWatcher = null;
+    }
+  }
+
+  function subscribeLatency(cb: LatencySub): () => void {
+    latencySubs.add(cb);
+    ensureLatencyWatching();
+    // Push the most recent snapshot to the new subscriber immediately so
+    // the UI shows something on open instead of waiting for the next
+    // 20-second log tick.
+    try { cb(lastLatencySnapshot); } catch { /* ignore */ }
+    return () => {
+      latencySubs.delete(cb);
+      if (latencySubs.size === 0) { stopLatencyWatching(); }
+    };
+  }
+
+  // Ensure the watcher is closed at extension deactivate even if all
+  // subscribers somehow leaked.
+  context.subscriptions.push({ dispose: stopLatencyWatching });
+
+  // Show Latency Stats command — opens a singleton webview that subscribes
+  // to the latency monitor.
+  let statsPanel: vscode.WebviewPanel | undefined;
+  context.subscriptions.push(
+    vscode.commands.registerCommand(COMMANDS.showStats, () => {
+      if (statsPanel) {
+        statsPanel.reveal(vscode.ViewColumn.Beside);
+        return;
+      }
+      statsPanel = vscode.window.createWebviewPanel(
+        'mooCaptureStats',
+        'Moo Capture Stats',
+        vscode.ViewColumn.Beside,
+        { enableScripts: true, retainContextWhenHidden: true },
+      );
+      statsPanel.webview.html = getStatsHtml();
+      const unsubscribe = subscribeLatency((snap) => {
+        if (!statsPanel) { return; }
+        statsPanel.webview.postMessage({ type: 'moo-stats-update', snap });
+      });
+      context.subscriptions.push(
+        statsPanel.onDidDispose(() => {
+          unsubscribe();
+          statsPanel = undefined;
+        }),
+      );
     }),
   );
 
@@ -1037,6 +1151,104 @@ function getLoadingHtml(): string {
     <h2>Moo Capture</h2>
     <p>Starting streaming relay...</p>
   </div>
+</body>
+</html>`;
+}
+
+function getStatsHtml(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; font-weight: 500; }
+    .sub { color: #a6adc8; font-size: 12px; margin: 0 0 24px; }
+    .empty { color: #f9e2af; font-size: 13px; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 16px;
+      max-width: 720px;
+    }
+    .card {
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 10px;
+      padding: 16px 20px;
+    }
+    .card .label { color: #a6adc8; font-size: 12px; margin-bottom: 8px; }
+    .card .avg { font-size: 28px; font-weight: 500; color: #a6e3a1; }
+    .card .unit { font-size: 13px; color: #a6adc8; margin-left: 4px; }
+    .card .range { font-size: 12px; color: #a6adc8; margin-top: 6px; }
+    .footer { color: #6c7086; font-size: 11px; margin-top: 24px; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>Moo Capture &mdash; Latency</h1>
+  <p class="sub">Parsed from the latest Sunshine log. Updates as Sunshine writes new debug lines (about every 20 seconds while streaming).</p>
+  <div id="empty" class="empty" style="display:none"></div>
+  <div id="cards" class="grid" style="display:none">
+    <div class="card">
+      <div class="label">Encode (frame processing)</div>
+      <div><span id="enc-avg" class="avg">-</span><span class="unit">ms avg</span></div>
+      <div class="range" id="enc-range">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="label">Network (Sunshine -> client)</div>
+      <div><span id="net-avg" class="avg">-</span><span class="unit">ms avg</span></div>
+      <div class="range" id="net-range">&mdash;</div>
+    </div>
+    <div class="card">
+      <div class="label">Encoded frame size</div>
+      <div><span id="size-avg" class="avg">-</span><span class="unit">kB avg</span></div>
+      <div class="range" id="size-range">&mdash;</div>
+    </div>
+  </div>
+  <div class="footer" id="provenance"></div>
+  <script>
+    (function() {
+      function setText(id, val) { document.getElementById(id).textContent = val; }
+      function fmt(n) { return (n === null || n === undefined) ? '-' : Number(n).toFixed(2); }
+      function range(t, unit) {
+        if (!t) { return '—'; }
+        return 'min ' + fmt(t.min) + unit + ' / max ' + fmt(t.max) + unit;
+      }
+      function render(snap) {
+        var empty = document.getElementById('empty');
+        var cards = document.getElementById('cards');
+        if (!snap || !snap.found) {
+          cards.style.display = 'none';
+          empty.style.display = 'block';
+          empty.textContent = (snap && snap.error) ? snap.error : 'Waiting for Sunshine logs...';
+          document.getElementById('provenance').textContent = '';
+          return;
+        }
+        cards.style.display = 'grid';
+        empty.style.display = 'none';
+        setText('enc-avg', fmt(snap.frameProcessingMs && snap.frameProcessingMs.avg));
+        setText('enc-range', range(snap.frameProcessingMs, 'ms'));
+        setText('net-avg', fmt(snap.networkMs && snap.networkMs.avg));
+        setText('net-range', range(snap.networkMs, 'ms'));
+        setText('size-avg', fmt(snap.encodedSizeKb && snap.encodedSizeKb.avg));
+        setText('size-range', range(snap.encodedSizeKb, 'kB'));
+        document.getElementById('provenance').textContent = 'Source: ' + (snap.logPath || '');
+      }
+      window.addEventListener('message', function(event) {
+        if (event && event.data && event.data.type === 'moo-stats-update') {
+          render(event.data.snap);
+        }
+      });
+      render(null);
+    })();
+  </script>
 </body>
 </html>`;
 }
