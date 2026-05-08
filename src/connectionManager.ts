@@ -20,6 +20,11 @@ export class ConnectionManager {
   private lastHostId: number | null = null;
   private onStateChange?: (state: ConnectionState, message?: string) => void;
 
+  // Session-count guard (iteration 3). SSE-driven; defensive against
+  // iteration 1's auto-detach=false fix not taking effect.
+  private hostStreamAbort: AbortController | null = null;
+  private guardCancelInFlight = false;
+
   private sunshineConfig: SunshineConfigManager | null = null;
 
   /** Vibeshine REST API credentials (set externally before connect if headless). */
@@ -154,6 +159,13 @@ export class ConnectionManager {
       this.output.appendLine(`[Connect] Apps: ${apps.map(a => a.name).join(', ')}`);
 
       this.setState('streaming', 'Connected');
+
+      // Start the session-count guard. SSE-driven, fires cancelStream once
+      // if the relay reports more than one active session for our host —
+      // belt-and-suspenders for the iteration 1 auto-detach fix. Lifecycle
+      // is owned by this manager: stopped on disconnect/dispose.
+      this.startSessionGuard(host.host_id);
+
       return { port, hostId: host.host_id, apps };
 
     } catch (err) {
@@ -337,6 +349,10 @@ export class ConnectionManager {
   }
 
   disconnect(): void {
+    // Stop the SSE session guard before cancelling: avoids the guard seeing
+    // its own cancel as a state change and trying to fire again.
+    this.stopSessionGuard();
+
     // Cancel the active stream on the host so streamer.exe stops
     if (this.apiClient && this.lastHostId) {
       this.apiClient.cancelStream(this.lastHostId).catch(() => {});
@@ -346,6 +362,73 @@ export class ConnectionManager {
     this.sunshineConfig = null;
 
     this.setState('disconnected');
+  }
+
+  // -------------------------------------------------------------------------
+  // Session-count guard
+  // -------------------------------------------------------------------------
+
+  private startSessionGuard(hostId: number): void {
+    this.stopSessionGuard();
+    if (!this.apiClient) { return; }
+
+    const abort = new AbortController();
+    this.hostStreamAbort = abort;
+
+    this.apiClient.streamHostUpdates(
+      abort.signal,
+      (host) => {
+        if (Number(host.host_id) !== hostId) { return; }
+        // Look for any of the known session-count indicators the relay may
+        // forward from Sunshine's serverinfo. Field name varies across
+        // relay/Sunshine versions; check several. If none are present, the
+        // guard simply never fires — iteration 1 alone is the fix.
+        const candidates: Array<unknown> = [
+          host.currentClients,
+          (host as Record<string, unknown>)['current_clients'],
+          (host as Record<string, unknown>)['active_sessions'],
+          (host as Record<string, unknown>)['sessions'],
+        ];
+        let count: number | null = null;
+        for (const c of candidates) {
+          if (typeof c === 'number') { count = c; break; }
+        }
+        if (count === null || count <= 1) { return; }
+        if (this.guardCancelInFlight) { return; }
+        if (abort.signal.aborted) { return; }
+
+        this.guardCancelInFlight = true;
+        this.output.appendLine(
+          `[SessionGuard] active sessions=${count} on host ${hostId} — cancelling to prevent audio doubling`,
+        );
+        const client = this.apiClient;
+        if (!client) { this.guardCancelInFlight = false; return; }
+
+        client.cancelStream(hostId)
+          .catch((err) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.output.appendLine(`[SessionGuard] cancelStream failed: ${msg}`);
+          })
+          .finally(() => {
+            // Reset so a fresh connect can re-arm the guard. The SSE handler
+            // itself will see count drop and not re-fire because the gate
+            // only fires once before the manager is disconnected.
+            this.guardCancelInFlight = false;
+          });
+      },
+      (err) => {
+        // SSE errors are non-fatal; the iteration 1 fix is the primary defence.
+        this.output.appendLine(`[SessionGuard] SSE error (non-fatal): ${err.message}`);
+      },
+    );
+  }
+
+  private stopSessionGuard(): void {
+    if (this.hostStreamAbort) {
+      this.hostStreamAbort.abort();
+      this.hostStreamAbort = null;
+    }
+    this.guardCancelInFlight = false;
   }
 
   dispose(): void {

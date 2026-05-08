@@ -136,6 +136,84 @@ export class RelayApiClient {
     this.output.appendLine(`[Relay API] Cancel stream: ${res.statusCode} ${body}`);
   }
 
+  /**
+   * Subscribe to /api/hosts as a long-lived SSE stream. Fires `onHost` for
+   * every host record (initial batch and live updates) until the abort
+   * signal fires or the request errors. Caller owns lifecycle.
+   *
+   * Used by ConnectionManager to detect Sunshine spawning a second
+   * concurrent session — when the cursor crosses display boundaries with
+   * auto-detach=true, audio doubles. iteration 1 prevents the trigger;
+   * this stream is the defensive guard.
+   */
+  streamHostUpdates(
+    abort: AbortSignal,
+    onHost: (host: RelayHost & Record<string, unknown>) => void,
+    onError?: (err: Error) => void,
+  ): void {
+    if (abort.aborted) { return; }
+
+    const options: http.RequestOptions = {
+      hostname: '127.0.0.1',
+      port: this.port,
+      path: '/api/hosts',
+      method: 'GET',
+      headers: this.authHeaders(),
+      agent: false, // Bypass VS Code/Cursor proxy-patched globalAgent
+    };
+
+    this.output.appendLine('[Relay API] Opening SSE host stream');
+
+    const req = http.request(options, (res) => {
+      if (res.statusCode !== 200) {
+        let body = '';
+        res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        res.on('end', () => onError?.(new Error(`SSE HTTP ${res.statusCode}: ${body.substring(0, 200)}`)));
+        return;
+      }
+
+      let buffer = '';
+      res.on('data', (chunk: Buffer) => {
+        if (abort.aborted) { return; }
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) { continue; }
+          try {
+            const data = JSON.parse(trimmed);
+            if (data.hosts && Array.isArray(data.hosts)) {
+              for (const h of data.hosts) { onHost(h as RelayHost & Record<string, unknown>); }
+            } else if (data.host_id !== undefined) {
+              onHost(data as RelayHost & Record<string, unknown>);
+            }
+          } catch { /* skip non-JSON lines */ }
+        }
+      });
+
+      res.on('end', () => {
+        // Stream closed by server — not an error if we asked to abort.
+        if (!abort.aborted) {
+          this.output.appendLine('[Relay API] SSE host stream ended (server closed)');
+        }
+      });
+
+      res.on('error', (err) => {
+        if (!abort.aborted) { onError?.(err); }
+      });
+    });
+
+    req.on('error', (err) => {
+      if (!abort.aborted) { onError?.(err); }
+    });
+
+    const onAbort = (): void => { req.destroy(); };
+    abort.addEventListener('abort', onAbort, { once: true });
+
+    req.end();
+  }
+
   // -------------------------------------------------------------------------
   // Pairing
   // -------------------------------------------------------------------------
