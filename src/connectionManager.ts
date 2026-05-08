@@ -46,6 +46,17 @@ export class ConnectionManager {
     this.onStateChange = cb;
   }
 
+  // Status-bar mute renderer (iteration 6). The extension wires this so
+  // changes coming back from the webview can update the mute status-bar
+  // icon without ConnectionManager importing vscode UI types.
+  private muteStateRenderer?: (muted: boolean | null) => void;
+  setMuteStateRenderer(cb: (muted: boolean | null) => void): void {
+    this.muteStateRenderer = cb;
+  }
+  notifyMuteState(muted: boolean | null): void {
+    this.muteStateRenderer?.(muted);
+  }
+
   private setState(state: ConnectionState, message?: string): void {
     this.state = state;
     this.onStateChange?.(state, message);

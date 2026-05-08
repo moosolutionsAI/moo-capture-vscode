@@ -189,10 +189,52 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.show();
   context.subscriptions.push(statusBar);
 
+  // Mute status-bar item — visible only while streaming. Click runs the
+  // toggleMute command (same path as Ctrl+Shift+M and the floating toolbar
+  // button) so all three controls share a single mute pipeline.
+  const muteStatusBar = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    STATUS_BAR_PRIORITY - 1,
+  );
+  muteStatusBar.command = COMMANDS.toggleMute;
+  muteStatusBar.text = '$(unmute)';
+  muteStatusBar.tooltip = 'Stream audio (click to mute, Ctrl+Shift+M)';
+  context.subscriptions.push(muteStatusBar);
+
+  // Render the icon based on mute state. Updated by webview messages.
+  let muteState: boolean | null = null;
+  const renderMuteStatusBar = (): void => {
+    if (muteState === null) {
+      muteStatusBar.text = '$(unmute)';
+      muteStatusBar.tooltip = 'Stream audio (click to mute, Ctrl+Shift+M)';
+    } else if (muteState) {
+      muteStatusBar.text = '$(mute)';
+      muteStatusBar.tooltip = 'Stream muted (click to unmute, Ctrl+Shift+M)';
+    } else {
+      muteStatusBar.text = '$(unmute)';
+      muteStatusBar.tooltip = 'Stream audio (click to mute, Ctrl+Shift+M)';
+    }
+  };
+  renderMuteStatusBar();
+  // Expose the setter on the manager so other code can sync state without
+  // closing over module-private symbols. Keeps lifecycle coupled to connect.
+  connManager.setMuteStateRenderer((next) => {
+    muteState = next;
+    renderMuteStatusBar();
+  });
+
   connManager.onState((state: ConnectionState, message?: string) => {
     statusBar.text = STATE_LABELS[state];
     if (message) {
       statusBar.tooltip = message;
+    }
+    if (state === 'streaming') {
+      muteStatusBar.show();
+    } else {
+      muteStatusBar.hide();
+      // Reset for next session so the icon does not flash a stale state.
+      muteState = null;
+      renderMuteStatusBar();
     }
   });
 
@@ -315,14 +357,16 @@ export function activate(context: vscode.ExtensionContext): void {
         output.appendLine(`[Connect] ${apps.length} app(s) available. Showing in-stream launcher.`);
         panel.webview.html = getWebviewContent('', port, hostId, apps);
 
-        // Listen for app selection from the webview
-        panel.webview.onDidReceiveMessage((msg: { command: string; appId?: number; appName?: string }) => {
+        // Listen for app selection and mute-state updates from the webview
+        panel.webview.onDidReceiveMessage((msg: { command?: string; type?: string; appId?: number; appName?: string; muted?: boolean }) => {
           if (msg.command === 'launchApp' && msg.appId !== undefined) {
             const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${msg.appId}`;
             output.appendLine(`[Connect] Launching ${msg.appName}: ${streamUrl}`);
             if (panel) {
               panel.webview.html = getWebviewContent(streamUrl, port, hostId, apps);
             }
+          } else if (msg.type === 'moo-mute' && typeof msg.muted === 'boolean') {
+            connManager.notifyMuteState(msg.muted);
           }
         });
       } catch (err) {
@@ -701,6 +745,10 @@ function getWebviewContent(
       const muteBtn = document.getElementById('mute-btn');
       if (muteBtn) {
         let muted = true;
+        function publishMuteState() {
+          // Forward to the extension so the status-bar mute icon stays in sync.
+          vscode.postMessage({ type: 'moo-mute', muted: muted });
+        }
         muteBtn.addEventListener('click', function() {
           muted = !muted;
           muteBtn.textContent = muted ? 'Unmute' : 'Mute';
@@ -710,6 +758,7 @@ function getWebviewContent(
           if (frame) {
             frame.contentWindow.postMessage({ type: 'moo-set-mute', muted: muted }, '*');
           }
+          publishMuteState();
         });
         // Listen for mute state changes from the iframe (sidebar mute button)
         // and toggle requests from the extension (ctrl+shift+m keybinding).
@@ -719,6 +768,7 @@ function getWebviewContent(
             muted = event.data.muted;
             muteBtn.textContent = muted ? 'Unmute' : 'Mute';
             muteBtn.classList.toggle('active', !muted);
+            publishMuteState();
           } else if (event.data.type === 'moo-toggle-mute') {
             // Programmatic click reuses the existing handler so the iframe
             // postMessage and label sync stay on a single path.
