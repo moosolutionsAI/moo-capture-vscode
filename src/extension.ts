@@ -619,8 +619,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // Tune Stream — quick-pick preset selector for the latency-relevant
-  // settings. Game Mode picks the lowest-latency combo, Quality Mode picks
-  // the highest-fidelity combo, Custom hands off to openSettings.
+  // settings. Esports = aggressive low latency (Tekken, FPS), Game =
+  // balanced (action / RPG), Video = quality (watching), Custom = settings.
   //
   // Recursion / re-fire audit (iter 9): tuneStream cannot re-enter itself.
   // The selection path is settings update -> optional reconnect modal ->
@@ -633,22 +633,28 @@ export function activate(context: vscode.ExtensionContext): void {
       if (tuneStreamBusy) { return; }
       tuneStreamBusy = true;
       try {
-      type PresetId = 'game' | 'quality' | 'custom';
+      type PresetId = 'esports' | 'game' | 'video' | 'custom';
       interface Preset extends vscode.QuickPickItem {
         id: PresetId;
       }
       const items: Preset[] = [
         {
+          id: 'esports',
+          label: '$(zap) Esports Mode',
+          description: 'h264 / 120 fps / 15000 Kbps / 1280x720',
+          detail: 'Aggressive low latency. Tekken, fighters, FPS, rhythm games.',
+        },
+        {
           id: 'game',
           label: '$(rocket) Game Mode',
           description: 'h264 / 60 fps / 30000 Kbps / 1920x1080',
-          detail: 'Lowest latency. Best for action games.',
+          detail: 'Balanced. Action games, single-player, RPGs.',
         },
         {
-          id: 'quality',
-          label: '$(symbol-color) Quality Mode',
-          description: 'hevc / 60 fps / 20000 Kbps / 2560x1440',
-          detail: 'Highest fidelity. Best for slow / desktop content.',
+          id: 'video',
+          label: '$(device-camera-video) Video Mode',
+          description: 'hevc / 60 fps / 25000 Kbps / 2560x1440',
+          detail: 'Highest fidelity. Watching streams, video, desktop content.',
         },
         {
           id: 'custom',
@@ -667,15 +673,20 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
       const target = vscode.ConfigurationTarget.Global;
-      if (choice.id === 'game') {
+      if (choice.id === 'esports') {
+        await cfg.update('codec', 'h264', target);
+        await cfg.update('fps', 120, target);
+        await cfg.update('bitrate', 15000, target);
+        await cfg.update('resolution', '1280x720', target);
+      } else if (choice.id === 'game') {
         await cfg.update('codec', 'h264', target);
         await cfg.update('fps', 60, target);
         await cfg.update('bitrate', 30000, target);
         await cfg.update('resolution', '1920x1080', target);
-      } else if (choice.id === 'quality') {
+      } else if (choice.id === 'video') {
         await cfg.update('codec', 'hevc', target);
         await cfg.update('fps', 60, target);
-        await cfg.update('bitrate', 20000, target);
+        await cfg.update('bitrate', 25000, target);
         await cfg.update('resolution', '2560x1440', target);
       }
       const presetName = choice.label.replace(/^\$\([^)]+\)\s*/, '');
