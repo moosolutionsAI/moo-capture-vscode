@@ -621,8 +621,18 @@ export function activate(context: vscode.ExtensionContext): void {
   // Tune Stream — quick-pick preset selector for the latency-relevant
   // settings. Game Mode picks the lowest-latency combo, Quality Mode picks
   // the highest-fidelity combo, Custom hands off to openSettings.
+  //
+  // Recursion / re-fire audit (iter 9): tuneStream cannot re-enter itself.
+  // The selection path is settings update -> optional reconnect modal ->
+  // optional disconnect command. None of those re-invoke tuneStream.
+  // tuneStreamBusy is a UX guard against rapid double-invocation racing
+  // two quick-picks.
+  let tuneStreamBusy = false;
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.tuneStream, async () => {
+      if (tuneStreamBusy) { return; }
+      tuneStreamBusy = true;
+      try {
       type PresetId = 'game' | 'quality' | 'custom';
       interface Preset extends vscode.QuickPickItem {
         id: PresetId;
@@ -692,6 +702,9 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.showInformationMessage(
         `Moo Capture: ${presetName} preset saved. Connect to apply.`,
       );
+      } finally {
+        tuneStreamBusy = false;
+      }
     }),
   );
 
