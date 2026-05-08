@@ -19,7 +19,8 @@
     "onCommand:moo-capture.connect",
     "onCommand:moo-capture.disconnect",
     "onCommand:moo-capture.shutdown",
-    "onCommand:moo-capture.setupVirtualDisplay"
+    "onCommand:moo-capture.setupVirtualDisplay",
+    "onCommand:moo-capture.toggleMute"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -46,6 +47,12 @@
         "command": "moo-capture.setupVirtualDisplay",
         "title": "Setup Virtual Display (Headless Mode)",
         "category": "Moo Capture"
+      },
+      {
+        "command": "moo-capture.toggleMute",
+        "title": "Toggle Stream Audio Mute",
+        "icon": "$(mute)",
+        "category": "Moo Capture"
       }
     ],
     "keybindings": [
@@ -53,6 +60,11 @@
         "command": "moo-capture.connect",
         "key": "ctrl+shift+g",
         "mac": "cmd+shift+g"
+      },
+      {
+        "command": "moo-capture.toggleMute",
+        "key": "ctrl+shift+m",
+        "mac": "cmd+shift+m"
       }
     ],
     "configuration": {

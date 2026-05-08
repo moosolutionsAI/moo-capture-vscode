@@ -395,6 +395,19 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  // Toggle Mute command — keybinding ctrl+shift+m. Forwards to the active
+  // panel which delegates to the existing mute button click handler so the
+  // actual mute logic lives in one place.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(COMMANDS.toggleMute, () => {
+      if (!panel) {
+        vscode.window.showInformationMessage('Moo Capture: connect first to control stream audio.');
+        return;
+      }
+      panel.webview.postMessage({ type: 'moo-toggle-mute' });
+    }),
+  );
+
   // Setup Virtual Display command
   context.subscriptions.push(
     vscode.commands.registerCommand('moo-capture.setupVirtualDisplay', async () => {
@@ -692,11 +705,17 @@ function getWebviewContent(
           }
         });
         // Listen for mute state changes from the iframe (sidebar mute button)
+        // and toggle requests from the extension (ctrl+shift+m keybinding).
         window.addEventListener('message', function(event) {
-          if (event.data && event.data.type === 'moo-mute') {
+          if (!event.data) { return; }
+          if (event.data.type === 'moo-mute') {
             muted = event.data.muted;
             muteBtn.textContent = muted ? 'Unmute' : 'Mute';
             muteBtn.classList.toggle('active', !muted);
+          } else if (event.data.type === 'moo-toggle-mute') {
+            // Programmatic click reuses the existing handler so the iframe
+            // postMessage and label sync stay on a single path.
+            muteBtn.click();
           }
         });
       }
