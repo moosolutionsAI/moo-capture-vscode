@@ -12,8 +12,13 @@ import type { MooCaptureConfig, ConnectionState } from './types';
 
 function getConfig(): MooCaptureConfig {
   const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
+  // Moonlight applies a "remote IPv4 streaming" 1024-byte MTU cap when the
+  // resolved host is non-loopback. "localhost" can resolve via DNS to a
+  // non-loopback interface on Windows, so always use the literal loopback IP.
+  const rawHost = cfg.get<string>('sunshineHost', '127.0.0.1');
+  const sunshineHost = (rawHost === 'localhost' || rawHost === '::1') ? '127.0.0.1' : rawHost;
   return {
-    sunshineHost: cfg.get<string>('sunshineHost', '127.0.0.1'),
+    sunshineHost,
     sunshinePort: cfg.get<number>('sunshinePort', 47989),
     relayPort: cfg.get<number>('relayPort', RELAY_DEFAULT_PORT),
     resolution: cfg.get<string>('resolution', '1920x1080'),
@@ -348,21 +353,45 @@ export function activate(context: vscode.ExtensionContext): void {
   // Shutdown command (stops everything — relay, stream, cleanup)
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.shutdown, async () => {
-      const confirm = await vscode.window.showWarningMessage(
-        'Shut down Moo Capture completely? This stops the relay and stream.',
+      const choice = await vscode.window.showWarningMessage(
+        'Shut down Moo Capture? The virtual display can be kept for quick reconnect or removed.',
         { modal: true },
-        'Shutdown',
+        'Shutdown (Keep Display)',
+        'Shutdown & Remove Display',
       );
-      if (confirm !== 'Shutdown') { return; }
+      if (!choice) { return; }
 
       connManager.dispose();
       if (panel) {
         panel.dispose();
         panel = undefined;
       }
+
+      if (choice === 'Shutdown & Remove Display') {
+        const vdm = new VirtualDisplayManager(output);
+        try {
+          const installed = await vdm.isVddInstalled();
+          if (installed) {
+            output.appendLine('[Shutdown] Disabling virtual display device...');
+            await vdm.disableVdd();
+            output.appendLine('[Shutdown] Virtual display removed.');
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          output.appendLine(`[Shutdown] Failed to remove virtual display: ${msg}`);
+          vscode.window.showWarningMessage(
+            `Virtual display could not be removed: ${msg}. You may need to disable it manually in Device Manager.`,
+          );
+        }
+      }
+
       statusBar.text = STATE_LABELS.disconnected;
       statusBar.tooltip = 'Click to connect to Vibeshine';
-      vscode.window.showInformationMessage('Moo Capture shut down. Relay stopped.');
+      vscode.window.showInformationMessage(
+        choice === 'Shutdown & Remove Display'
+          ? 'Moo Capture shut down. Relay stopped and virtual display removed.'
+          : 'Moo Capture shut down. Relay stopped. Virtual display kept for quick reconnect.',
+      );
     }),
   );
 
@@ -580,7 +609,7 @@ function getWebviewContent(
   ${isStreaming ? `<iframe
     id="streamFrame"
     src="${streamUrl}"
-    allow="autoplay; fullscreen; microphone; gamepad; camera; display-capture"
+    allow="autoplay; fullscreen; microphone; gamepad; camera; display-capture; pointer-lock; keyboard-map; clipboard-read; clipboard-write"
     allowfullscreen
   ></iframe>` : ''}
 
@@ -656,14 +685,19 @@ function getWebviewContent(
           muted = !muted;
           muteBtn.textContent = muted ? 'Unmute' : 'Mute';
           muteBtn.classList.toggle('active', !muted);
-          // Mute/unmute all audio in the iframe
-          try {
-            const frame = document.getElementById('streamFrame');
-            if (frame && frame.contentDocument) {
-              var videos = frame.contentDocument.querySelectorAll('video, audio');
-              videos.forEach(function(v) { v.muted = muted; });
-            }
-          } catch(e) { /* cross-origin — iframe handles its own audio */ }
+          // Send mute command to iframe via postMessage (cross-origin safe)
+          var frame = document.getElementById('streamFrame');
+          if (frame) {
+            frame.contentWindow.postMessage({ type: 'moo-set-mute', muted: muted }, '*');
+          }
+        });
+        // Listen for mute state changes from the iframe (sidebar mute button)
+        window.addEventListener('message', function(event) {
+          if (event.data && event.data.type === 'moo-mute') {
+            muted = event.data.muted;
+            muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+            muteBtn.classList.toggle('active', !muted);
+          }
         });
       }
 

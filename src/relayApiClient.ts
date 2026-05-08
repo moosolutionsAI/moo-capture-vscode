@@ -73,20 +73,22 @@ export class RelayApiClient {
     const body = await this.getStreaming('/api/hosts', 2000);
     this.output.appendLine(`[Relay API] Hosts: ${body.substring(0, 500)}`);
 
-    const hosts: RelayHost[] = [];
+    // Dedup by host_id, keeping the LAST occurrence — SSE updates after the
+    // initial batch carry fresher state (e.g. server_state: "Free").
+    const hostMap = new Map<number, RelayHost>();
     for (const line of body.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) { continue; }
       try {
         const data = JSON.parse(trimmed);
         if (data.hosts && Array.isArray(data.hosts)) {
-          hosts.push(...data.hosts);
+          for (const h of data.hosts) { hostMap.set(Number(h.host_id), h); }
         } else if (data.host_id !== undefined) {
-          hosts.push(data as RelayHost);
+          hostMap.set(Number(data.host_id), data as RelayHost);
         }
       } catch { /* skip non-JSON lines */ }
     }
-    return hosts;
+    return [...hostMap.values()];
   }
 
   /** Add a new Sunshine host */
