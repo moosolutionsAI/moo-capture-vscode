@@ -5,6 +5,7 @@ import { COMMANDS, CONFIG_SECTION, STATUS_BAR_PRIORITY, RELAY_DEFAULT_PORT, SUNS
 import { ConnectionManager } from './connectionManager';
 import { VirtualDisplayManager } from './virtualDisplayManager';
 import { readLatencySnapshot, type LatencySnapshot, EMPTY_SNAPSHOT } from './sunshineLogReader';
+import { startStreamHealthWatchdog, type StreamHealthHandle } from './streamHealthWatchdog';
 import type { MooCaptureConfig, ConnectionState } from './types';
 
 // ---------------------------------------------------------------------------
@@ -251,6 +252,19 @@ export function activate(context: vscode.ExtensionContext): void {
   // entering streaming state, released when leaving.
   let latencyUnsub: (() => void) | null = null;
 
+  // Stream health watchdog handle (PHASE THREE). Lifecycle mirrors
+  // latencyUnsub: started on streaming-state, disposed on leaving it.
+  // Reacts to spontaneous CLIENT DISCONNECTED events in the Sunshine log
+  // and triggers programmatic reconnect to mask Chromium's WebRTC
+  // throttling-induced drops (the 35-53min spontaneous-disconnect class
+  // documented in plans/auto-reconnect/diagnosis.md).
+  let watchdogHandle: StreamHealthHandle | null = null;
+  // Timestamp of the most recent INTENTIONAL disconnect — both user-
+  // initiated (Disconnect command) and programmatic (tuneStream reconnect,
+  // watchdog reconnect). Used to gate the watchdog from re-firing on the
+  // CLIENT DISCONNECTED line that its OWN cancelStream produced.
+  let lastIntentionalDisconnectMs = 0;
+
   // Render the icon based on mute state. Updated by webview messages.
   let muteState: boolean | null = null;
   const renderMuteStatusBar = (): void => {
@@ -296,6 +310,34 @@ export function activate(context: vscode.ExtensionContext): void {
           latencyStatusBar.tooltip = `Encode ${enc} ms / Network ${net} ms (click for full Stats)`;
         });
       }
+      // Start the stream health watchdog. Single-slot guard mirrors
+      // latencyUnsub above so re-entry into 'streaming' (e.g. transient
+      // state churn) cannot spawn a second watchdog.
+      if (!watchdogHandle) {
+        watchdogHandle = startStreamHealthWatchdog({
+          sunshineLogDir: SUNSHINE_LOG_DIR,
+          output,
+          isPanelOpen: () => panel !== undefined,
+          isUserDisconnectRecent: () =>
+            (Date.now() - lastIntentionalDisconnectMs) < 2000,
+          triggerReconnect: async () => {
+            // Mirrors the tuneStream reconnect pattern at line 784-795.
+            // programmaticReconnect = true skips the panel-dispose modal.
+            // 1500ms wait lets Sunshine's encoder teardown complete before
+            // the new connect — observed in the log as "Async encoder
+            // teardown complete" arriving ~50ms after CLIENT DISCONNECTED.
+            programmaticReconnect = true;
+            try {
+              await vscode.commands.executeCommand(COMMANDS.disconnect);
+              await new Promise((r) => setTimeout(r, 1500));
+              await vscode.commands.executeCommand(COMMANDS.connect);
+            } finally {
+              programmaticReconnect = false;
+            }
+          },
+          subscribeTicks,
+        });
+      }
       latencyStatusBar.show();
     } else {
       muteStatusBar.hide();
@@ -305,6 +347,10 @@ export function activate(context: vscode.ExtensionContext): void {
       // Drop the latency subscription so the watcher can stop if no Stats
       // panel is also subscribed.
       if (latencyUnsub) { latencyUnsub(); latencyUnsub = null; }
+      // Dispose the watchdog when leaving streaming. Same single-slot
+      // pattern as latencyUnsub — disposed instance is dropped to null
+      // so a future re-entry into 'streaming' constructs a fresh one.
+      if (watchdogHandle) { watchdogHandle.dispose(); watchdogHandle = null; }
       latencyStatusBar.text = '$(pulse) --/-- ms';
       latencyStatusBar.hide();
     }
@@ -383,6 +429,8 @@ export function activate(context: vscode.ExtensionContext): void {
             // call here guarantees the cancelStream HTTP is dispatched
             // the moment the panel disappears, regardless of whether
             // the modal ever resolves.
+            lastIntentionalDisconnectMs = Date.now();
+            watchdogHandle?.noteUserDisconnect();
             connManager.disconnect();
 
             // Programmatic reconnect: skip the user-facing modal — we're
@@ -484,6 +532,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // Disconnect command (stops stream, keeps relay for quick reconnect)
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.disconnect, () => {
+      // Record intent timestamp BEFORE disconnect so the watchdog's
+      // 2-second gate reliably suppresses the CLIENT DISCONNECTED line
+      // that this disconnect itself produces. Both user clicks AND
+      // programmatic reconnects (tuneStream, watchdog) flow through here.
+      lastIntentionalDisconnectMs = Date.now();
+      watchdogHandle?.noteUserDisconnect();
       connManager.disconnect();
       if (panel) {
         panel.dispose();
@@ -685,6 +739,14 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({
     dispose: () => {
       if (latencyUnsub) { latencyUnsub(); latencyUnsub = null; }
+    },
+  });
+  // Stream health watchdog teardown — same explicit-cleanup pattern as
+  // latencyUnsub. Defends against a refactor that breaks the
+  // onState('disconnected') dispose path.
+  context.subscriptions.push({
+    dispose: () => {
+      if (watchdogHandle) { watchdogHandle.dispose(); watchdogHandle = null; }
     },
   });
 
