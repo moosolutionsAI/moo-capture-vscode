@@ -258,12 +258,47 @@ export function activate(context: vscode.ExtensionContext): void {
   // and triggers programmatic reconnect to mask Chromium's WebRTC
   // throttling-induced drops (the 35-53min spontaneous-disconnect class
   // documented in plans/auto-reconnect/diagnosis.md).
+  //
+  // Recursion / cycle audit (iter 11). The full reconnect cycle is:
+  //   tick → tick() reads new bytes, finds DISCONNECTED, gates pass,
+  //          cancelInFlight=true, triggerReconnect() called
+  //     → COMMANDS.disconnect:
+  //          lastIntentionalDisconnectMs = now
+  //          connManager.disconnect → onState('disconnected')
+  //              → watchdogHandle.dispose() (THIS watchdog gone)
+  //              → watchdogHandle = null
+  //          panel.dispose() (idempotent disconnect skipped, modal skipped
+  //              because programmaticReconnect=true)
+  //     → snapshot ownDisconnectMs (== lastIntentionalDisconnectMs from
+  //          our own disconnect call above)
+  //     → 1500ms settle (nothing else listens — old watchdog disposed,
+  //          new one not yet constructed)
+  //     → if intent changed during settle → return (abort)
+  //     → COMMANDS.connect → eventually onState('streaming')
+  //              → NEW watchdog constructed, trackedOffset pinned to EOF
+  //                so the disconnect line that triggered this cycle is
+  //                BELOW the new offset, never re-scanned
+  //
+  // The cycle is bounded as long as each reconnect actually reaches
+  // streaming state. If reconnect itself fails or the new connection
+  // immediately disconnects, the NEW watchdog could trigger another
+  // reconnect, and so on — runaway loop. The circuit breaker below
+  // (reconnectTimestamps + RECONNECT_LIMIT) caps attempts at 3 per
+  // 60s window, then surfaces a warning and gives up.
   let watchdogHandle: StreamHealthHandle | null = null;
   // Timestamp of the most recent INTENTIONAL disconnect — both user-
   // initiated (Disconnect command) and programmatic (tuneStream reconnect,
   // watchdog reconnect). Used to gate the watchdog from re-firing on the
   // CLIENT DISCONNECTED line that its OWN cancelStream produced.
   let lastIntentionalDisconnectMs = 0;
+  // Circuit breaker for runaway watchdog reconnect loops. Shared across
+  // watchdog instances (lives in activate() scope) so a fresh watchdog
+  // after a successful reconnect does not reset the counter — protects
+  // against the "every reconnect immediately fails" scenario where the
+  // root cause is persistent (e.g. Vibeshine crashed, network partition).
+  const reconnectTimestamps: number[] = [];
+  const RECONNECT_LIMIT = 3;
+  const RECONNECT_WINDOW_MS = 60_000;
 
   // Render the icon based on mute state. Updated by webview messages.
   let muteState: boolean | null = null;
@@ -326,6 +361,30 @@ export function activate(context: vscode.ExtensionContext): void {
             // 1500ms wait lets Sunshine's encoder teardown complete before
             // the new connect — observed in the log as "Async encoder
             // teardown complete" arriving ~50ms after CLIENT DISCONNECTED.
+
+            // Circuit breaker check BEFORE we change any state. If the
+            // user has already burned through RECONNECT_LIMIT attempts in
+            // RECONNECT_WINDOW_MS, the root cause is persistent and we
+            // should stop fighting it. Surface a warning so the user
+            // knows what happened.
+            const now = Date.now();
+            while (
+              reconnectTimestamps.length > 0 &&
+              reconnectTimestamps[0] < now - RECONNECT_WINDOW_MS
+            ) {
+              reconnectTimestamps.shift();
+            }
+            if (reconnectTimestamps.length >= RECONNECT_LIMIT) {
+              output.appendLine(
+                `[HealthWatchdog] circuit-breaker: ${RECONNECT_LIMIT} reconnects in ${RECONNECT_WINDOW_MS}ms — giving up`,
+              );
+              vscode.window.showWarningMessage(
+                'Moo Capture: stream keeps dropping. Auto-reconnect disabled. Reconnect manually after fixing the cause.',
+              );
+              return;
+            }
+            reconnectTimestamps.push(now);
+
             programmaticReconnect = true;
             try {
               await vscode.commands.executeCommand(COMMANDS.disconnect);
