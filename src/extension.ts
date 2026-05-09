@@ -557,7 +557,9 @@ export function activate(context: vscode.ExtensionContext): void {
   //
   // Iter 1 (Stats panel) and iter 2 (status-bar item) both subscribe via
   // subscribeLatency. Iter 3 audited the lifecycle and documents the
-  // invariants here.
+  // invariants here. Iter 8 added a parallel `tickSubs` channel for
+  // consumers that need to react to log-file changes without parsing a
+  // snapshot (StreamHealthWatchdog uses it for incremental tail reads).
   //
   // Invariants (must hold across all paths):
   //   - exactly one fs.FSWatcher exists at a time, on `latencyWatcher`
@@ -565,18 +567,22 @@ export function activate(context: vscode.ExtensionContext): void {
   //   - `stopLatencyWatching` is idempotent and closes both
   //   - `ensureLatencyWatching` returns early if a watcher exists, never
   //     accumulates
-  //   - `latencySubs` is the only fanout target; entries are cleared on
-  //     unsubscribe
+  //   - `latencySubs` and `tickSubs` are the only fanout targets; entries
+  //     are cleared on unsubscribe
   //   - watcher is closed via TWO dispose paths: last-unsubscribe and
   //     extension deactivate; both call stopLatencyWatching which is safe
   //     to call repeatedly
+  //   - watcher stays alive while EITHER set is non-empty; closes only
+  //     when both reach zero (last-unsubscribe path)
   //   - log file is read-only; the watcher cannot trigger a write that
   //     re-fires itself
-  //   - fanOutLatency snapshots the subscriber Set before iterating so a
+  //   - fanOutLatency snapshots both subscriber Sets before iterating so a
   //     callback that unsubscribes during fanout does not desync iteration
   // ---------------------------------------------------------------------------
   type LatencySub = (snapshot: LatencySnapshot) => void;
+  type TickSub = () => void;
   const latencySubs = new Set<LatencySub>();
+  const tickSubs = new Set<TickSub>();
   let latencyWatcher: fs.FSWatcher | null = null;
   let latencyDebounce: NodeJS.Timeout | null = null;
   let lastLatencySnapshot: LatencySnapshot = EMPTY_SNAPSHOT;
@@ -589,6 +595,12 @@ export function activate(context: vscode.ExtensionContext): void {
     const subs = Array.from(latencySubs);
     for (const sub of subs) {
       try { sub(lastLatencySnapshot); } catch { /* never let a bad sub break others */ }
+    }
+    // Same snapshot-then-iterate pattern for the tick channel. Tick
+    // callbacks have no payload — they're a "log changed, go look" pulse.
+    const ticks = Array.from(tickSubs);
+    for (const tick of ticks) {
+      try { tick(); } catch { /* never let a bad sub break others */ }
     }
   }
 
@@ -644,7 +656,22 @@ export function activate(context: vscode.ExtensionContext): void {
     try { cb(lastLatencySnapshot); } catch { /* ignore */ }
     return () => {
       latencySubs.delete(cb);
-      if (latencySubs.size === 0) { stopLatencyWatching(); }
+      if (latencySubs.size === 0 && tickSubs.size === 0) { stopLatencyWatching(); }
+    };
+  }
+
+  /**
+   * Subscribe to log-file change pulses without parsing a latency snapshot.
+   * Used by StreamHealthWatchdog to drive its incremental tail reads.
+   * Watcher is shared with subscribeLatency — only stopped when BOTH sets
+   * reach zero subscribers.
+   */
+  function subscribeTicks(cb: TickSub): () => void {
+    tickSubs.add(cb);
+    ensureLatencyWatching();
+    return () => {
+      tickSubs.delete(cb);
+      if (latencySubs.size === 0 && tickSubs.size === 0) { stopLatencyWatching(); }
     };
   }
 
