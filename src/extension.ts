@@ -212,8 +212,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const connManager = new ConnectionManager(output, context.globalStorageUri.fsPath);
   let panel: vscode.WebviewPanel | undefined;
   // Set during a known disconnect+reconnect transition (e.g. preset apply)
-  // so the panel.onDidDispose handler skips its interactive Keep / Stop /
-  // Shutdown modal. Cleared by the path that set it.
+  // so the panel.onDidDispose handler skips its interactive Keep Relay /
+  // Shut Down modal. Cleared by the path that set it.
   let programmaticReconnect = false;
 
   // Status bar
@@ -375,36 +375,41 @@ export function activate(context: vscode.ExtensionContext): void {
         // reference is ever lost without dispose firing.
         context.subscriptions.push(
           panel.onDidDispose(async () => {
+            // CRITICAL: dispose synchronously BEFORE awaiting the modal.
+            // The 2026-05-09 16:27 collision was caused by Cursor reload
+            // tearing down the extension host while this handler was
+            // suspended at the await below — disconnect() was reached
+            // only on interactive close, never on reload. Moving the
+            // call here guarantees the cancelStream HTTP is dispatched
+            // the moment the panel disappears, regardless of whether
+            // the modal ever resolves.
+            connManager.disconnect();
+
             // Programmatic reconnect: skip the user-facing modal — we're
             // tearing the panel down deliberately to apply new settings.
             // The triggering path (e.g. tuneStream) is responsible for
             // creating a new panel via the connect command.
             if (programmaticReconnect) {
-              connManager.disconnect();
               statusBar.text = STATE_LABELS.disconnected;
               statusBar.tooltip = 'Reconnecting with new settings...';
               panel = undefined;
               return;
             }
-            // Prompt the user for what to do on tab close
+            // Modal collapsed from 3 options to 2 since the stream is
+            // always cancelled above. The only meaningful question is
+            // whether to also stop the relay binary for a cold restart.
             const choice = await vscode.window.showInformationMessage(
-              'Moo Capture tab closed. What would you like to do?',
-              'Keep Relay Running',
-              'Stop Stream',
-              'Shutdown Everything',
+              'Moo Capture tab closed. Keep relay running for fast reconnect?',
+              'Keep Relay',
+              'Shut Down Everything',
             );
 
-            if (choice === 'Shutdown Everything') {
+            if (choice === 'Shut Down Everything') {
               connManager.dispose();
               statusBar.text = STATE_LABELS.disconnected;
               statusBar.tooltip = 'Relay stopped. Click to reconnect.';
-            } else if (choice === 'Stop Stream') {
-              connManager.disconnect();
-              statusBar.text = STATE_LABELS.disconnected;
-              statusBar.tooltip = 'Stream stopped. Relay still running for quick reconnect.';
             } else {
-              // Keep Relay Running (or dismissed) — just cancel the active stream
-              connManager.disconnect();
+              // Keep Relay (or dismissed) — stream already cancelled above.
               statusBar.text = '$(game) Moo Capture (Ready)';
               statusBar.tooltip = 'Relay running. Click to reconnect instantly.';
             }
