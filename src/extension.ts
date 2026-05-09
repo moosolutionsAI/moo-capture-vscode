@@ -385,6 +385,15 @@ export function activate(context: vscode.ExtensionContext): void {
             }
             reconnectTimestamps.push(now);
 
+            // Visible feedback so the user understands the brief flicker.
+            // setStatusBarMessage owns its own dismissal timer (4s covers
+            // the 1.5s settle plus typical reconnect time). No teardown
+            // to register — VS Code manages the message lifecycle.
+            vscode.window.setStatusBarMessage(
+              '$(sync~spin) Moo Capture: auto-reconnecting…',
+              4000,
+            );
+
             programmaticReconnect = true;
             try {
               await vscode.commands.executeCommand(COMMANDS.disconnect);
