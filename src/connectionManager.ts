@@ -110,6 +110,12 @@ export class ConnectionManager {
         });
       }
 
+      // Idempotent self-heal: re-apply the in-page mute patch on every
+      // connect so existing installs get the fix without a relay re-download
+      // and so manual edits to the relay's static files can't drift the
+      // mute behaviour. Cheap (one stat + one read on the hot path).
+      this.downloader.ensureMutePatch();
+
       // Step 2: Start relay (try alternative ports if default is taken)
       this.setState('starting_relay', 'Starting streaming relay...');
       if (!this.relay.isRunning) {
@@ -138,6 +144,18 @@ export class ConnectionManager {
       // Step 3: Login
       this.apiClient = new RelayApiClient(port, this.output);
       await this.apiClient.login(RELAY_INTERNAL_USER, RELAY_INTERNAL_PASS);
+
+      // Step 3.5: Persisted-session orphan cleanup. The defensive teardown
+      // above (line 85) cannot fire after Cursor reload because the new
+      // ConnectionManager has fresh null state. The persisted-session file
+      // (written on every successful connect, deleted on disconnect)
+      // survives reload and lets us cancel any orphaned Sunshine session
+      // before the new connect collides with it. Multi-window safe: this
+      // only fires inside a user-initiated connect() call, so the user is
+      // explicitly asking for a new session — overriding any prior one
+      // matches that intent. The 2026-05-09 16:27 collision class is the
+      // motivating case.
+      await this.cleanupOrphanSession(this.apiClient);
 
       // Step 4: Ensure host is added AND paired
       let host = await this.ensureHostPaired(config, onNeedPairPin);
@@ -172,6 +190,11 @@ export class ConnectionManager {
         }
       }
       this.output.appendLine(`[Connect] Apps: ${apps.map(a => a.name).join(', ')}`);
+
+      // Persist session info so a future Cursor reload's connect() can
+      // clean up this session via cleanupOrphanSession even though the
+      // new ConnectionManager instance has fresh null state.
+      this.persistSession(host.host_id);
 
       this.setState('streaming', 'Connected');
 
@@ -374,9 +397,69 @@ export class ConnectionManager {
       this.output.appendLine(`[Disconnect] Cancelled stream on host ${this.lastHostId}`);
     }
 
+    // Drop the persisted session sentinel so the next connect()'s
+    // cleanupOrphanSession does not re-fire cancelStream on a host
+    // we have already cleaned up.
+    this.clearPersistedSession();
+
     this.sunshineConfig = null;
 
     this.setState('disconnected');
+  }
+
+  // -------------------------------------------------------------------------
+  // Persisted-session sentinel — survives Cursor reload so cleanupOrphan
+  // -------------------------------------------------------------------------
+
+  private get sessionSentinelPath(): string {
+    return path.join(this.globalStoragePath, 'last-session.json');
+  }
+
+  private persistSession(hostId: number): void {
+    try {
+      fs.writeFileSync(
+        this.sessionSentinelPath,
+        JSON.stringify({ hostId, timestamp: Date.now() }),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[Connect] persistSession failed (non-fatal): ${msg}`);
+    }
+  }
+
+  private clearPersistedSession(): void {
+    try {
+      if (fs.existsSync(this.sessionSentinelPath)) {
+        fs.unlinkSync(this.sessionSentinelPath);
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  private async cleanupOrphanSession(client: RelayApiClient): Promise<void> {
+    if (!fs.existsSync(this.sessionSentinelPath)) { return; }
+    try {
+      const raw = fs.readFileSync(this.sessionSentinelPath, 'utf8');
+      const session = JSON.parse(raw) as { hostId?: unknown; timestamp?: unknown };
+      const hostId = typeof session.hostId === 'number' ? session.hostId : null;
+      const ts = typeof session.timestamp === 'number' ? session.timestamp : 0;
+      const ageMs = Date.now() - ts;
+      const MAX_AGE_MS = 60 * 60 * 1000; // 1 hour — older is almost certainly stale
+      if (ageMs > MAX_AGE_MS) {
+        this.output.appendLine(
+          `[OrphanCleanup] Session sentinel ${Math.round(ageMs / 60000)}min old — discarding`,
+        );
+        this.clearPersistedSession();
+        return;
+      }
+      if (hostId === null) { return; }
+      await client.cancelStream(hostId).catch(() => { /* harmless if no stream */ });
+      this.output.appendLine(
+        `[OrphanCleanup] Cancelled possibly-orphaned stream on host ${hostId} (sentinel age ${Math.round(ageMs / 1000)}s)`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[OrphanCleanup] Skipped (${msg})`);
+    }
   }
 
   // -------------------------------------------------------------------------
