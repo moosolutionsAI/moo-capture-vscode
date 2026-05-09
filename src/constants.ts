@@ -40,6 +40,32 @@ export const RELAY_INTERNAL_PASS = 'moo-capture-internal';
 // Extension
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Stream health watchdog + iframe heartbeat (PHASE THREE / FOUR)
+// ---------------------------------------------------------------------------
+
+/** How often the parent checks whether the iframe heartbeat is overdue. */
+export const HEARTBEAT_CHECK_INTERVAL_MS = 1000;
+/** Gap that triggers heartbeat-timeout reconnect (panel must be visible). */
+export const HEARTBEAT_TIMEOUT_MS = 5000;
+/**
+ * The iframe-side heartbeat interval is hardcoded in MOO_MUTE_JS (browser
+ * JS, not Node). Documented here for parity — if you change one, change
+ * both. The 2000ms cadence keeps the parent's 5000ms timeout window
+ * comfortably above 2x the heartbeat period.
+ */
+export const HEARTBEAT_INTERVAL_MS_DOCUMENTED = 2000;
+
+/**
+ * Circuit breaker against runaway reconnect loops. If fireReconnect is
+ * called RECONNECT_LIMIT times within RECONNECT_WINDOW_MS, the breaker
+ * trips and surfaces a warning instead of attempting a (likely-failing)
+ * reconnect. Manual reconnect resets the counter naturally as old
+ * timestamps age out of the window.
+ */
+export const RECONNECT_LIMIT = 3;
+export const RECONNECT_WINDOW_MS = 60_000;
+
 export const EXTENSION_ID = 'moo-capture';
 export const COMMANDS = {
   connect: 'moo-capture.connect',

@@ -1,7 +1,17 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { COMMANDS, CONFIG_SECTION, STATUS_BAR_PRIORITY, RELAY_DEFAULT_PORT, SUNSHINE_LOG_DIR } from './constants';
+import {
+  COMMANDS,
+  CONFIG_SECTION,
+  STATUS_BAR_PRIORITY,
+  RELAY_DEFAULT_PORT,
+  SUNSHINE_LOG_DIR,
+  HEARTBEAT_TIMEOUT_MS,
+  HEARTBEAT_CHECK_INTERVAL_MS,
+  RECONNECT_LIMIT,
+  RECONNECT_WINDOW_MS,
+} from './constants';
 import { ConnectionManager } from './connectionManager';
 import { VirtualDisplayManager } from './virtualDisplayManager';
 import { readLatencySnapshot, type LatencySnapshot, EMPTY_SNAPSHOT } from './sunshineLogReader';
@@ -296,9 +306,11 @@ export function activate(context: vscode.ExtensionContext): void {
   // after a successful reconnect does not reset the counter — protects
   // against the "every reconnect immediately fails" scenario where the
   // root cause is persistent (e.g. Vibeshine crashed, network partition).
+  // Sliding window of reconnect attempt timestamps; gates the circuit
+  // breaker. Limits and window size live in constants.ts (RECONNECT_LIMIT,
+  // RECONNECT_WINDOW_MS) so they're discoverable alongside other tuning
+  // knobs.
   const reconnectTimestamps: number[] = [];
-  const RECONNECT_LIMIT = 3;
-  const RECONNECT_WINDOW_MS = 60_000;
   // Shared in-flight gate for fireReconnect — both the log-watchdog AND
   // the heartbeat detector route through it, so they cannot double-fire
   // a reconnect concurrently.
@@ -330,11 +342,11 @@ export function activate(context: vscode.ExtensionContext): void {
   //     from triggering a second reconnect while one is already running
   //     (fast belt-and-suspenders alongside the lastHeartbeatMs reset
   //     done inside the checker on fire)
+  // Tuning constants HEARTBEAT_TIMEOUT_MS / HEARTBEAT_CHECK_INTERVAL_MS
+  // imported from constants.ts.
   let lastHeartbeatMs = Date.now();
   let hasReceivedFirstHeartbeat = false;
   let heartbeatChecker: NodeJS.Timeout | null = null;
-  const HEARTBEAT_TIMEOUT_MS = 5000;
-  const HEARTBEAT_CHECK_INTERVAL_MS = 1000;
 
   /**
    * Single reconnect entry point. Both the log-watchdog (PHASE THREE)
