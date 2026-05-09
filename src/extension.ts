@@ -329,7 +329,19 @@ export function activate(context: vscode.ExtensionContext): void {
             programmaticReconnect = true;
             try {
               await vscode.commands.executeCommand(COMMANDS.disconnect);
+              // Snapshot the intent timestamp set by our own disconnect.
+              // Any later update during the settle means a NEW intentional
+              // disconnect happened (user clicked Disconnect, ran Shutdown,
+              // tuneStream took over) — honour that intent and abort the
+              // reconnect rather than fighting the user.
+              const ownDisconnectMs = lastIntentionalDisconnectMs;
               await new Promise((r) => setTimeout(r, 1500));
+              if (lastIntentionalDisconnectMs !== ownDisconnectMs) {
+                output.appendLine(
+                  '[HealthWatchdog] reconnect aborted — intent changed during 1.5s settle',
+                );
+                return;
+              }
               await vscode.commands.executeCommand(COMMANDS.connect);
             } finally {
               programmaticReconnect = false;
