@@ -10,6 +10,50 @@ import {
   RELAY_BINARY_NAME_WIN,
 } from './constants';
 
+// In-page mute handler + heartbeat injected into the relay's stream.html.
+//
+// MUTE: the parent webview cannot reach the iframe's <audio> element to set
+// .muted (the existing in-extension bridge silently fails because the audio
+// element is either unreachable cross-origin or not yet mounted at install
+// time). This snippet runs in the relay's own document, so the querySelector
+// resolves against the right tree and DOM access is same-origin. Listener
+// arms before the audio pipeline initialises, so toggling mute before audio
+// starts is remembered when the element appears (the next moo-set-mute
+// message wins).
+//
+// HEARTBEAT (PHASE FOUR): posts moo-heartbeat to window.parent every 2000ms.
+// The parent's onDidReceiveMessage handler resets a per-panel timeout. If
+// 5000ms passes without a heartbeat AND the panel is visible, the parent
+// triggers a programmatic reconnect (PHASE THREE). Sub-2s detection
+// complements the Sunshine-log watchdog — catches iframe death (page
+// navigated, JS crashed, GPU process killed) faster than Sunshine can log
+// CLIENT DISCONNECTED.
+//
+// The setInterval lives in the iframe's JS context; cleanup is automatic
+// when the page unloads. Per the loop's CRITICAL RULES, this is browser
+// JS not Node — the registered-teardown rule covers extension code only.
+//
+// Version marker (v2) is the ensureMutePatch drift detector — bumping the
+// marker forces a content-mismatch and re-write on existing installs the
+// next time connect() runs ensureMutePatch.
+const MOO_MUTE_JS = `// Injected by moo-capture-vscode v2 (mute + heartbeat). Do not edit.
+window.addEventListener('message', function (e) {
+  if (!e || !e.data || e.data.type !== 'moo-set-mute') { return; }
+  var audio = document.querySelector('audio.audio-stream');
+  if (audio) { audio.muted = !!e.data.muted; }
+});
+
+setInterval(function () {
+  try {
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage({ type: 'moo-heartbeat' }, '*');
+    }
+  } catch (_) { /* parent may be cross-origin in some contexts */ }
+}, 2000);
+`;
+const MOO_MUTE_SCRIPT_TAG = '<script src="moo-mute.js"></script>';
+const MOO_MUTE_MARKER = 'moo-mute.js';
+
 /**
  * Downloads moonlight-web-stream from GitHub releases and extracts it.
  * Returns the path to the executable.
@@ -79,8 +123,54 @@ export class RelayDownloader {
     }
 
     this.output.appendLine(`[Relay Download] Binary ready at ${this.binaryPath}`);
+    this.ensureMutePatch();
     onProgress?.('Ready');
     return this.binaryPath;
+  }
+
+  /**
+   * Idempotently inject the in-page mute handler into the relay's static
+   * files. Safe to call on every connect — only writes when content drifts
+   * or the script tag is missing. Survives relay re-downloads (caller
+   * invokes after download() too).
+   */
+  ensureMutePatch(): void {
+    const staticDir = path.join(this.installDir, 'static');
+    const jsPath = path.join(staticDir, 'moo-mute.js');
+    const htmlPath = path.join(staticDir, 'stream.html');
+
+    if (!fs.existsSync(staticDir) || !fs.existsSync(htmlPath)) {
+      // Relay layout unexpected — skip rather than throw. Streaming will
+      // still work; only the in-app mute button degrades to no-op.
+      return;
+    }
+
+    try {
+      const existingJs = fs.existsSync(jsPath) ? fs.readFileSync(jsPath, 'utf8') : null;
+      if (existingJs !== MOO_MUTE_JS) {
+        fs.writeFileSync(jsPath, MOO_MUTE_JS, 'utf8');
+        this.output.appendLine('[Relay Patch] Wrote moo-mute.js');
+      }
+
+      const html = fs.readFileSync(htmlPath, 'utf8');
+      if (!html.includes(MOO_MUTE_MARKER)) {
+        const closingHead = '</head>';
+        const idx = html.indexOf(closingHead);
+        if (idx === -1) {
+          this.output.appendLine('[Relay Patch] stream.html missing </head>; skipped tag injection');
+          return;
+        }
+        const patched =
+          html.slice(0, idx) +
+          `    ${MOO_MUTE_SCRIPT_TAG}\n` +
+          html.slice(idx);
+        fs.writeFileSync(htmlPath, patched, 'utf8');
+        this.output.appendLine('[Relay Patch] Injected moo-mute.js script tag into stream.html');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[Relay Patch] Failed: ${msg}`);
+    }
   }
 
   private findBinary(dir: string, name: string): string | undefined {
