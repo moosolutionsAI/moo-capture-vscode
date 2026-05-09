@@ -308,8 +308,30 @@ export function activate(context: vscode.ExtensionContext): void {
   // posts {type:'moo-heartbeat'} every 2000ms; the parent records the
   // most recent receive time and a per-panel 1000ms checker fires
   // fireReconnect('heartbeat-timeout') when 5000ms has passed AND the
-  // panel is visible (hidden panels expect Chromium throttling).
+  // panel is visible AND at least one heartbeat has ever been received.
+  //
+  // Lifecycle invariants (iter 15 audit):
+  //   - exactly one heartbeatChecker setInterval at a time (single slot)
+  //   - re-creation always preceded by clearInterval (the if (!panel)
+  //     block runs once per panel session, but the clearInterval is
+  //     defensive against any future code path that recreates the
+  //     panel without disposing first)
+  //   - cleared via THREE paths: panel.onDidDispose,
+  //     COMMANDS.disconnect (implicit via panel.dispose), and
+  //     context.subscriptions on extension deactivate
+  //   - hasReceivedFirstHeartbeat reset when starting a new checker
+  //     so a cold-start iframe (slow first-heartbeat) cannot trigger
+  //     a false-positive timeout reconnect
+  //   - panel.visible gate prevents Chromium-throttled hidden iframes
+  //     from triggering false positives
+  //   - lastHeartbeatMs reset on EVERY fireReconnect finally so the
+  //     new session starts with a fresh window
+  //   - reconnectInFlight gate in fireReconnect prevents the checker
+  //     from triggering a second reconnect while one is already running
+  //     (fast belt-and-suspenders alongside the lastHeartbeatMs reset
+  //     done inside the checker on fire)
   let lastHeartbeatMs = Date.now();
+  let hasReceivedFirstHeartbeat = false;
   let heartbeatChecker: NodeJS.Timeout | null = null;
   const HEARTBEAT_TIMEOUT_MS = 5000;
   const HEARTBEAT_CHECK_INTERVAL_MS = 1000;
@@ -374,9 +396,11 @@ export function activate(context: vscode.ExtensionContext): void {
     } finally {
       programmaticReconnect = false;
       reconnectInFlight = false;
-      // Reset heartbeat clock so the new session has a fresh window
-      // before its first heartbeat arrives.
+      // Reset heartbeat clock AND the cold-start gate so the new
+      // session has a fresh window AND can't trip the timeout before
+      // the new iframe has a chance to send its first heartbeat.
       lastHeartbeatMs = Date.now();
+      hasReceivedFirstHeartbeat = false;
     }
   }
 
@@ -573,15 +597,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
         // Heartbeat checker — fires fireReconnect if 5000ms elapses
         // without a moo-heartbeat from the iframe AND the panel is
-        // visible. Hidden panels expect Chromium to throttle the
-        // setInterval inside the iframe, so we deliberately do NOT
-        // act on missed heartbeats while hidden — that's a false
-        // positive scenario. Cleared in panel.onDidDispose AND
+        // visible AND at least one heartbeat has ever been received.
+        // Hidden panels expect Chromium to throttle the setInterval
+        // inside the iframe, so we deliberately do NOT act on missed
+        // heartbeats while hidden. Cold-start iframes can take a few
+        // seconds to load and start posting; the
+        // hasReceivedFirstHeartbeat gate suppresses false positives
+        // during that window. Cleared in panel.onDidDispose AND
         // registered with context.subscriptions for deactivate.
         lastHeartbeatMs = Date.now();
+        hasReceivedFirstHeartbeat = false;
         if (heartbeatChecker) { clearInterval(heartbeatChecker); }
         heartbeatChecker = setInterval(() => {
           if (!panel || !panel.visible) { return; }
+          if (!hasReceivedFirstHeartbeat) { return; }
           if (Date.now() - lastHeartbeatMs > HEARTBEAT_TIMEOUT_MS) {
             // Reset clock so we don't fire-and-fire while reconnect
             // is in flight (fireReconnect's reconnectInFlight gate
@@ -642,6 +671,7 @@ export function activate(context: vscode.ExtensionContext): void {
               connManager.notifyMuteState(msg.muted);
             } else if (msg.type === 'moo-heartbeat') {
               lastHeartbeatMs = Date.now();
+              hasReceivedFirstHeartbeat = true;
             }
           }),
         );
