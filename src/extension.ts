@@ -299,6 +299,86 @@ export function activate(context: vscode.ExtensionContext): void {
   const reconnectTimestamps: number[] = [];
   const RECONNECT_LIMIT = 3;
   const RECONNECT_WINDOW_MS = 60_000;
+  // Shared in-flight gate for fireReconnect — both the log-watchdog AND
+  // the heartbeat detector route through it, so they cannot double-fire
+  // a reconnect concurrently.
+  let reconnectInFlight = false;
+
+  // Iframe heartbeat tracking (PHASE FOUR). The injected moo-mute.js
+  // posts {type:'moo-heartbeat'} every 2000ms; the parent records the
+  // most recent receive time and a per-panel 1000ms checker fires
+  // fireReconnect('heartbeat-timeout') when 5000ms has passed AND the
+  // panel is visible (hidden panels expect Chromium throttling).
+  let lastHeartbeatMs = Date.now();
+  let heartbeatChecker: NodeJS.Timeout | null = null;
+  const HEARTBEAT_TIMEOUT_MS = 5000;
+  const HEARTBEAT_CHECK_INTERVAL_MS = 1000;
+
+  /**
+   * Single reconnect entry point. Both the log-watchdog (PHASE THREE)
+   * and the heartbeat detector (PHASE FOUR) call this — `reconnectInFlight`
+   * makes it safe to invoke from multiple sources without double-firing.
+   * Circuit breaker, intent-snapshot guard, and programmaticReconnect
+   * handling all live here so callers stay simple.
+   */
+  async function fireReconnect(reason: string): Promise<void> {
+    if (reconnectInFlight) {
+      output.appendLine(`[Reconnect:${reason}] already in flight — skipping`);
+      return;
+    }
+
+    // Circuit breaker check BEFORE we change any state. If the user has
+    // already burned through RECONNECT_LIMIT attempts in
+    // RECONNECT_WINDOW_MS, the root cause is persistent and we should
+    // stop fighting it. Surface a warning so the user knows what happened.
+    const now = Date.now();
+    while (
+      reconnectTimestamps.length > 0 &&
+      reconnectTimestamps[0] < now - RECONNECT_WINDOW_MS
+    ) {
+      reconnectTimestamps.shift();
+    }
+    if (reconnectTimestamps.length >= RECONNECT_LIMIT) {
+      output.appendLine(
+        `[Reconnect:${reason}] circuit-breaker: ${RECONNECT_LIMIT} reconnects in ${RECONNECT_WINDOW_MS}ms — giving up`,
+      );
+      vscode.window.showWarningMessage(
+        'Moo Capture: stream keeps dropping. Auto-reconnect disabled. Reconnect manually after fixing the cause.',
+      );
+      return;
+    }
+    reconnectTimestamps.push(now);
+
+    // Visible feedback so the user understands the brief flicker.
+    vscode.window.setStatusBarMessage(
+      `$(sync~spin) Moo Capture: auto-reconnecting (${reason})…`,
+      4000,
+    );
+
+    reconnectInFlight = true;
+    programmaticReconnect = true;
+    try {
+      await vscode.commands.executeCommand(COMMANDS.disconnect);
+      // Snapshot the intent timestamp set by our own disconnect. Any
+      // later update during the settle means a NEW intentional disconnect
+      // happened — honour that intent and abort.
+      const ownDisconnectMs = lastIntentionalDisconnectMs;
+      await new Promise((r) => setTimeout(r, 1500));
+      if (lastIntentionalDisconnectMs !== ownDisconnectMs) {
+        output.appendLine(
+          `[Reconnect:${reason}] aborted — intent changed during 1.5s settle`,
+        );
+        return;
+      }
+      await vscode.commands.executeCommand(COMMANDS.connect);
+    } finally {
+      programmaticReconnect = false;
+      reconnectInFlight = false;
+      // Reset heartbeat clock so the new session has a fresh window
+      // before its first heartbeat arrives.
+      lastHeartbeatMs = Date.now();
+    }
+  }
 
   // Render the icon based on mute state. Updated by webview messages.
   let muteState: boolean | null = null;
@@ -355,66 +435,7 @@ export function activate(context: vscode.ExtensionContext): void {
           isPanelOpen: () => panel !== undefined,
           isUserDisconnectRecent: () =>
             (Date.now() - lastIntentionalDisconnectMs) < 2000,
-          triggerReconnect: async () => {
-            // Mirrors the tuneStream reconnect pattern at line 784-795.
-            // programmaticReconnect = true skips the panel-dispose modal.
-            // 1500ms wait lets Sunshine's encoder teardown complete before
-            // the new connect — observed in the log as "Async encoder
-            // teardown complete" arriving ~50ms after CLIENT DISCONNECTED.
-
-            // Circuit breaker check BEFORE we change any state. If the
-            // user has already burned through RECONNECT_LIMIT attempts in
-            // RECONNECT_WINDOW_MS, the root cause is persistent and we
-            // should stop fighting it. Surface a warning so the user
-            // knows what happened.
-            const now = Date.now();
-            while (
-              reconnectTimestamps.length > 0 &&
-              reconnectTimestamps[0] < now - RECONNECT_WINDOW_MS
-            ) {
-              reconnectTimestamps.shift();
-            }
-            if (reconnectTimestamps.length >= RECONNECT_LIMIT) {
-              output.appendLine(
-                `[HealthWatchdog] circuit-breaker: ${RECONNECT_LIMIT} reconnects in ${RECONNECT_WINDOW_MS}ms — giving up`,
-              );
-              vscode.window.showWarningMessage(
-                'Moo Capture: stream keeps dropping. Auto-reconnect disabled. Reconnect manually after fixing the cause.',
-              );
-              return;
-            }
-            reconnectTimestamps.push(now);
-
-            // Visible feedback so the user understands the brief flicker.
-            // setStatusBarMessage owns its own dismissal timer (4s covers
-            // the 1.5s settle plus typical reconnect time). No teardown
-            // to register — VS Code manages the message lifecycle.
-            vscode.window.setStatusBarMessage(
-              '$(sync~spin) Moo Capture: auto-reconnecting…',
-              4000,
-            );
-
-            programmaticReconnect = true;
-            try {
-              await vscode.commands.executeCommand(COMMANDS.disconnect);
-              // Snapshot the intent timestamp set by our own disconnect.
-              // Any later update during the settle means a NEW intentional
-              // disconnect happened (user clicked Disconnect, ran Shutdown,
-              // tuneStream took over) — honour that intent and abort the
-              // reconnect rather than fighting the user.
-              const ownDisconnectMs = lastIntentionalDisconnectMs;
-              await new Promise((r) => setTimeout(r, 1500));
-              if (lastIntentionalDisconnectMs !== ownDisconnectMs) {
-                output.appendLine(
-                  '[HealthWatchdog] reconnect aborted — intent changed during 1.5s settle',
-                );
-                return;
-              }
-              await vscode.commands.executeCommand(COMMANDS.connect);
-            } finally {
-              programmaticReconnect = false;
-            }
-          },
+          triggerReconnect: () => fireReconnect('log-watchdog'),
           subscribeTicks,
         });
       }
@@ -511,6 +532,8 @@ export function activate(context: vscode.ExtensionContext): void {
             // the modal ever resolves.
             lastIntentionalDisconnectMs = Date.now();
             watchdogHandle?.noteUserDisconnect();
+            // Stop the heartbeat checker — the iframe is gone.
+            if (heartbeatChecker) { clearInterval(heartbeatChecker); heartbeatChecker = null; }
             connManager.disconnect();
 
             // Programmatic reconnect: skip the user-facing modal — we're
@@ -547,6 +570,29 @@ export function activate(context: vscode.ExtensionContext): void {
 
         // Show loading state while relay starts up
         panel.webview.html = getLoadingHtml();
+
+        // Heartbeat checker — fires fireReconnect if 5000ms elapses
+        // without a moo-heartbeat from the iframe AND the panel is
+        // visible. Hidden panels expect Chromium to throttle the
+        // setInterval inside the iframe, so we deliberately do NOT
+        // act on missed heartbeats while hidden — that's a false
+        // positive scenario. Cleared in panel.onDidDispose AND
+        // registered with context.subscriptions for deactivate.
+        lastHeartbeatMs = Date.now();
+        if (heartbeatChecker) { clearInterval(heartbeatChecker); }
+        heartbeatChecker = setInterval(() => {
+          if (!panel || !panel.visible) { return; }
+          if (Date.now() - lastHeartbeatMs > HEARTBEAT_TIMEOUT_MS) {
+            // Reset clock so we don't fire-and-fire while reconnect
+            // is in flight (fireReconnect's reconnectInFlight gate
+            // handles that too, but resetting here avoids log spam).
+            lastHeartbeatMs = Date.now();
+            output.appendLine(
+              `[Heartbeat] no iframe heartbeat for ${HEARTBEAT_TIMEOUT_MS}ms while panel visible`,
+            );
+            void fireReconnect('heartbeat-timeout');
+          }
+        }, HEARTBEAT_CHECK_INTERVAL_MS);
       } else {
         panel.reveal(vscode.ViewColumn.One);
       }
@@ -594,6 +640,8 @@ export function activate(context: vscode.ExtensionContext): void {
               }
             } else if (msg.type === 'moo-mute' && typeof msg.muted === 'boolean') {
               connManager.notifyMuteState(msg.muted);
+            } else if (msg.type === 'moo-heartbeat') {
+              lastHeartbeatMs = Date.now();
             }
           }),
         );
@@ -827,6 +875,14 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({
     dispose: () => {
       if (watchdogHandle) { watchdogHandle.dispose(); watchdogHandle = null; }
+    },
+  });
+  // Heartbeat checker teardown — fires at extension deactivate even if
+  // panel.onDidDispose was missed for any reason. Mirrors the
+  // watchdog teardown pattern above.
+  context.subscriptions.push({
+    dispose: () => {
+      if (heartbeatChecker) { clearInterval(heartbeatChecker); heartbeatChecker = null; }
     },
   });
 
@@ -1350,6 +1406,12 @@ function getWebviewContent(
             // Programmatic click reuses the existing handler so the iframe
             // postMessage and label sync stay on a single path.
             muteBtn.click();
+          } else if (event.data.type === 'moo-heartbeat') {
+            // Forward iframe heartbeat to the extension. The extension's
+            // onDidReceiveMessage updates lastHeartbeatMs; the per-panel
+            // heartbeatChecker setInterval fires fireReconnect when the
+            // gap exceeds HEARTBEAT_TIMEOUT_MS.
+            vscode.postMessage({ type: 'moo-heartbeat' });
           }
           // Suppress unused warning; SENDER_IFRAME is used by symmetry/docs
           // but the outer never SENDS as iframe — the iframe stamps its own.
