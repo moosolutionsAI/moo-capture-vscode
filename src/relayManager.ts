@@ -45,17 +45,36 @@ export class RelayManager {
     await this.spawnRelay(binaryPath, port, dataDir);
   }
 
-  /** Kill any orphaned web-server.exe processes from previous sessions. */
+  /**
+   * Kill any orphaned web-server.exe AND streamer.exe processes from
+   * previous sessions.
+   *
+   * Streamer.exe is the moonlight-web-stream child that holds the UDP
+   * socket to Sunshine. It is NOT job-parented to web-server.exe, so a
+   * parent kill leaves the child running — 2026-05-09 PID 44080 was a
+   * confirmed orphan that contributed to the 16:27 collision class.
+   *
+   * Path filter scopes the kill to processes whose .Path contains our
+   * relay install directory, so we never disturb an unrelated 'streamer'
+   * process a user might happen to run. Forward-slash normalisation
+   * sidesteps backslash escaping through the JS-template-to-PowerShell
+   * boundary.
+   */
   private killStaleRelayProcesses(binaryPath: string): Promise<void> {
     return new Promise((resolve) => {
       const { exec } = require('child_process') as typeof import('child_process');
       const binaryName = path.basename(binaryPath, '.exe');
+      const installDirFwd = path.dirname(binaryPath).replace(/\\/g, '/').toLowerCase();
+      const psCmd =
+        `Get-Process -Name '${binaryName}','streamer' -ErrorAction SilentlyContinue | ` +
+        `Where-Object { $_.Path -and ($_.Path.Replace('\\','/').ToLower().StartsWith('${installDirFwd}/')) } | ` +
+        `Stop-Process -Force`;
       exec(
-        `powershell -NoProfile -Command "Get-Process -Name '${binaryName}' -ErrorAction SilentlyContinue | Stop-Process -Force"`,
+        `powershell -NoProfile -Command "${psCmd}"`,
         { timeout: 5000 },
         (err) => {
           if (!err) {
-            this.output.appendLine('[Relay] Killed stale relay processes');
+            this.output.appendLine('[Relay] Killed stale relay + streamer processes');
           }
           resolve();
         },
