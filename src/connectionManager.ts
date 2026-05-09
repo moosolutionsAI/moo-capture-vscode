@@ -391,20 +391,59 @@ export class ConnectionManager {
     // its own cancel as a state change and trying to fire again.
     this.stopSessionGuard();
 
-    // Cancel the active stream on the host so streamer.exe stops
+    // Cancel the active stream on the host so streamer.exe stops.
+    // Fire-and-forget — synchronous callers (panel.onDidDispose, fireReconnect)
+    // can't block on HTTP. The sentinel survives this call so the NEXT
+    // connect's cleanupOrphanSession can re-fire if Sunshine never got
+    // the cancel (relay killed mid-flight, network hiccup, etc.).
     if (this.apiClient && this.lastHostId) {
       this.apiClient.cancelStream(this.lastHostId).catch(() => {});
       this.output.appendLine(`[Disconnect] Cancelled stream on host ${this.lastHostId}`);
     }
 
-    // Drop the persisted session sentinel so the next connect()'s
-    // cleanupOrphanSession does not re-fire cancelStream on a host
-    // we have already cleaned up.
-    this.clearPersistedSession();
+    // 0.1.7: do NOT clear the persisted-session sentinel here. Previously
+    // we cleared it eagerly, which meant if cancelStream never reached
+    // Sunshine (e.g. Shutdown Everything killed the relay before HTTP
+    // could complete), the next connect's cleanupOrphanSession found no
+    // sentinel and skipped — leaving Sunshine with an orphan session
+    // that collided with the new one. Now the sentinel persists; the
+    // next connect always tries to cancel it (no-op if already cleared)
+    // and only THEN deletes the sentinel.
 
     this.sunshineConfig = null;
 
     this.setState('disconnected');
+  }
+
+  /**
+   * 0.1.7: graceful shutdown for Shutdown Everything path. Awaits the
+   * cancelStream HTTP call AND a 500ms settle BEFORE killing the relay
+   * binary, so Sunshine actually receives and processes the cancel.
+   * Without this, dispose() killed the relay process while the cancel
+   * was still in flight — leaving an orphan session on Sunshine that
+   * blocked the next connect with `[active sessions: 2]` collision.
+   */
+  async gracefulDispose(): Promise<void> {
+    this.stopSessionGuard();
+
+    if (this.apiClient && this.lastHostId !== null) {
+      const hostId = this.lastHostId;
+      try {
+        await this.apiClient.cancelStream(hostId);
+        this.output.appendLine(`[Shutdown] Cancelled stream on host ${hostId} (graceful)`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`[Shutdown] cancelStream failed (proceeding anyway): ${msg}`);
+      }
+      // Settle: give the relay time to forward the cancel to Sunshine
+      // over the Moonlight protocol before we kill the relay binary.
+      await new Promise<void>((r) => setTimeout(r, 500));
+    }
+
+    this.clearPersistedSession();
+    this.sunshineConfig = null;
+    this.setState('disconnected');
+    this.relay.stop();
   }
 
   // -------------------------------------------------------------------------
@@ -451,11 +490,22 @@ export class ConnectionManager {
         this.clearPersistedSession();
         return;
       }
-      if (hostId === null) { return; }
+      if (hostId === null) {
+        this.clearPersistedSession();
+        return;
+      }
       await client.cancelStream(hostId).catch(() => { /* harmless if no stream */ });
       this.output.appendLine(
         `[OrphanCleanup] Cancelled possibly-orphaned stream on host ${hostId} (sentinel age ${Math.round(ageMs / 1000)}s)`,
       );
+      // 0.1.7: settle so Sunshine can fully release the orphan session
+      // before our connect proceeds to addHost. Without this, Sunshine
+      // can briefly report `[active sessions: 2]` and reject the new
+      // session within ~555ms.
+      await new Promise<void>((r) => setTimeout(r, 500));
+      // Sentinel served its purpose; clear it so we don't re-cancel on
+      // every subsequent connect when there's nothing to cancel.
+      this.clearPersistedSession();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[OrphanCleanup] Skipped (${msg})`);

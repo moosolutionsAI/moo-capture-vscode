@@ -56,16 +56,6 @@ export const HEARTBEAT_TIMEOUT_MS = 5000;
  */
 export const HEARTBEAT_INTERVAL_MS_DOCUMENTED = 2000;
 
-/**
- * Circuit breaker against runaway reconnect loops. If fireReconnect is
- * called RECONNECT_LIMIT times within RECONNECT_WINDOW_MS, the breaker
- * trips and surfaces a warning instead of attempting a (likely-failing)
- * reconnect. Manual reconnect resets the counter naturally as old
- * timestamps age out of the window.
- */
-export const RECONNECT_LIMIT = 3;
-export const RECONNECT_WINDOW_MS = 60_000;
-
 export const EXTENSION_ID = 'moo-capture';
 export const COMMANDS = {
   connect: 'moo-capture.connect',

@@ -2,9 +2,5 @@
   "mooCaptureVscode.sunshineHost": "localhost",
   "mooCaptureVscode.sunshinePort": 47984,
   "mooCaptureVscode.relayPath": "C:\\Dev\\MooKeyboardAI\\repos\\moonlight-web-stream\\web-server.exe",
-  "mooCaptureVscode.relayPort": 8080,
-  "mooCaptureVscode.resolution": "1920x1080",
-  "mooCaptureVscode.fps": 60,
-  "mooCaptureVscode.codec": "h264",
-  "mooCaptureVscode.bitrate": 20000
+  "mooCaptureVscode.relayPort": 8080
 }

@@ -10,7 +10,20 @@ import {
   RELAY_BINARY_NAME_WIN,
 } from './constants';
 
-// In-page mute handler + heartbeat injected into the relay's stream.html.
+// In-page mute handler + heartbeat + settings injection injected into the
+// relay's stream.html.
+//
+// SETTINGS (0.1.6): reads `mlSettings` from a base64-JSON `?mlSettings=`
+// URL query param and seeds it into localStorage BEFORE the relay's
+// stream.js parses. Replaces the parent's bootstrap → load → redirect
+// pattern (which loaded /index.html first only to get same-origin
+// localStorage write access, then redirected to stream.html). With
+// settings in the URL, stream.html can be loaded directly — one iframe
+// load instead of two. Saves ~600-900ms of cold-start budget and removes
+// a whole class of two-phase race conditions. The relay's
+// getLocalStreamSettings() at component/settings_menu.js:13 reads
+// localStorage.mlSettings — this IIFE runs first because moo-mute.js is
+// in <head> while stream.js is loaded as a deferred module.
 //
 // MUTE: the parent webview cannot reach the iframe's <audio> element to set
 // .muted (the existing in-extension bridge silently fails because the audio
@@ -33,10 +46,32 @@ import {
 // when the page unloads. Per the loop's CRITICAL RULES, this is browser
 // JS not Node — the registered-teardown rule covers extension code only.
 //
-// Version marker (v2) is the ensureMutePatch drift detector — bumping the
+// Version marker (v3) is the ensureMutePatch drift detector — bumping the
 // marker forces a content-mismatch and re-write on existing installs the
 // next time connect() runs ensureMutePatch.
-const MOO_MUTE_JS = `// Injected by moo-capture-vscode v2 (mute + heartbeat). Do not edit.
+const MOO_MUTE_JS = `// Injected by moo-capture-vscode v3 (mute + heartbeat + settings). Do not edit.
+
+// Settings injection (0.1.6): seed localStorage.mlSettings from URL param
+// before stream.js calls getLocalStreamSettings().
+(function () {
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var raw = params.get('mlSettings');
+    if (!raw) { return; }
+    var settings = JSON.parse(atob(raw));
+    var existing = {};
+    try {
+      var stored = localStorage.getItem('mlSettings');
+      if (stored) { existing = JSON.parse(stored); }
+    } catch (_) { /* corrupt — start fresh */ }
+    Object.assign(existing, settings);
+    localStorage.setItem('mlSettings', JSON.stringify(existing));
+    console.log('[moo-mute] Seeded mlSettings from URL:', settings);
+  } catch (e) {
+    console.warn('[moo-mute] Failed to parse mlSettings URL param:', e);
+  }
+})();
+
 window.addEventListener('message', function (e) {
   if (!e || !e.data || e.data.type !== 'moo-set-mute') { return; }
   var audio = document.querySelector('audio.audio-stream');

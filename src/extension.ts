@@ -9,8 +9,6 @@ import {
   SUNSHINE_LOG_DIR,
   HEARTBEAT_TIMEOUT_MS,
   HEARTBEAT_CHECK_INTERVAL_MS,
-  RECONNECT_LIMIT,
-  RECONNECT_WINDOW_MS,
 } from './constants';
 import { ConnectionManager } from './connectionManager';
 import { VirtualDisplayManager } from './virtualDisplayManager';
@@ -37,6 +35,19 @@ interface MlStreamSettings {
   videoSize: 'custom';
   videoSizeCustom: { width: number; height: number };
   videoCodec: 'h264' | 'h265';
+  /**
+   * Force the iframe's stream/index.js to skip WebRTC and use the
+   * WebSocket transport directly. Required on localhost: Chromium
+   * anonymises LAN host candidates as `*.local` mDNS names that the
+   * Rust relay cannot resolve, so WebRTC ICE always times out and
+   * falls back to WebSocket — but the relay's streamer.exe has
+   * already started its 10s "no transport attached" timer by then,
+   * so the fallback arrives after the streamer has self-terminated
+   * and the whole stream fails. Forcing 'websocket' skips the wasted
+   * WebRTC attempt entirely; the streamer sees SetTransport
+   * immediately and stays alive.
+   */
+  dataTransport: 'auto' | 'webrtc' | 'websocket';
 }
 
 function buildMlSettings(cfg: MooCaptureConfig): MlStreamSettings {
@@ -49,6 +60,7 @@ function buildMlSettings(cfg: MooCaptureConfig): MlStreamSettings {
     videoSize: 'custom',
     videoSizeCustom: { width, height },
     videoCodec: cfg.codec === 'hevc' ? 'h265' : 'h264',
+    dataTransport: 'websocket',
   };
 }
 
@@ -265,56 +277,33 @@ export function activate(context: vscode.ExtensionContext): void {
   // Stream health watchdog handle (PHASE THREE). Lifecycle mirrors
   // latencyUnsub: started on streaming-state, disposed on leaving it.
   // Reacts to spontaneous CLIENT DISCONNECTED events in the Sunshine log
-  // and triggers programmatic reconnect to mask Chromium's WebRTC
-  // throttling-induced drops (the 35-53min spontaneous-disconnect class
-  // documented in plans/auto-reconnect/diagnosis.md).
+  // by routing into fireReconnect, which prompts the user instead of
+  // tearing down silently — see fireReconnect below.
   //
-  // Recursion / cycle audit (iter 11). The full reconnect cycle is:
-  //   tick → tick() reads new bytes, finds DISCONNECTED, gates pass,
-  //          cancelInFlight=true, triggerReconnect() called
-  //     → COMMANDS.disconnect:
-  //          lastIntentionalDisconnectMs = now
-  //          connManager.disconnect → onState('disconnected')
-  //              → watchdogHandle.dispose() (THIS watchdog gone)
-  //              → watchdogHandle = null
-  //          panel.dispose() (idempotent disconnect skipped, modal skipped
-  //              because programmaticReconnect=true)
-  //     → snapshot ownDisconnectMs (== lastIntentionalDisconnectMs from
-  //          our own disconnect call above)
-  //     → 1500ms settle (nothing else listens — old watchdog disposed,
-  //          new one not yet constructed)
-  //     → if intent changed during settle → return (abort)
-  //     → COMMANDS.connect → eventually onState('streaming')
-  //              → NEW watchdog constructed, trackedOffset pinned to EOF
-  //                so the disconnect line that triggered this cycle is
-  //                BELOW the new offset, never re-scanned
-  //
-  // The cycle is bounded as long as each reconnect actually reaches
-  // streaming state. If reconnect itself fails or the new connection
-  // immediately disconnects, the NEW watchdog could trigger another
-  // reconnect, and so on — runaway loop. The circuit breaker below
-  // (reconnectTimestamps + RECONNECT_LIMIT) caps attempts at 3 per
-  // 60s window, then surfaces a warning and gives up.
+  // 0.1.4 design change: pre-0.1.4 the watchdog auto-cancelled and
+  // auto-reconnected. That tore down the relay session (and any virtual
+  // displays it owned) on every transient blip, and on cold-start
+  // failures it locked the user out of the manual-retry path that often
+  // succeeded on the second try. The watchdog now ALWAYS surfaces a
+  // toast with [Reconnect]/[Disconnect] — the user is the rate limiter,
+  // and virtual displays survive a dismissed prompt because we don't
+  // touch the relay until they choose. The old circuit-breaker state
+  // (reconnectTimestamps + RECONNECT_LIMIT/WINDOW_MS) is gone for the
+  // same reason.
   let watchdogHandle: StreamHealthHandle | null = null;
   // Timestamp of the most recent INTENTIONAL disconnect — both user-
   // initiated (Disconnect command) and programmatic (tuneStream reconnect,
   // watchdog reconnect). Used to gate the watchdog from re-firing on the
   // CLIENT DISCONNECTED line that its OWN cancelStream produced.
   let lastIntentionalDisconnectMs = 0;
-  // Circuit breaker for runaway watchdog reconnect loops. Shared across
-  // watchdog instances (lives in activate() scope) so a fresh watchdog
-  // after a successful reconnect does not reset the counter — protects
-  // against the "every reconnect immediately fails" scenario where the
-  // root cause is persistent (e.g. Vibeshine crashed, network partition).
-  // Sliding window of reconnect attempt timestamps; gates the circuit
-  // breaker. Limits and window size live in constants.ts (RECONNECT_LIMIT,
-  // RECONNECT_WINDOW_MS) so they're discoverable alongside other tuning
-  // knobs.
-  const reconnectTimestamps: number[] = [];
-  // Shared in-flight gate for fireReconnect — both the log-watchdog AND
-  // the heartbeat detector route through it, so they cannot double-fire
-  // a reconnect concurrently.
+  // Shared in-flight gate for fireReconnect's reconnect path — prevents
+  // a second reconnect cycle from starting while one is already running
+  // (e.g. user clicks Reconnect twice in rapid succession).
   let reconnectInFlight = false;
+  // Gate on the user-facing toast itself — prevents stacking duplicate
+  // toasts when both the heartbeat checker and the Sunshine log watchdog
+  // notice the same disconnect within the same window.
+  let promptInFlight = false;
 
   // Iframe heartbeat tracking (PHASE FOUR). The injected moo-mute.js
   // posts {type:'moo-heartbeat'} every 2000ms; the parent records the
@@ -336,83 +325,115 @@ export function activate(context: vscode.ExtensionContext): void {
   //     a false-positive timeout reconnect
   //   - panel.visible gate prevents Chromium-throttled hidden iframes
   //     from triggering false positives
-  //   - lastHeartbeatMs reset on EVERY fireReconnect finally so the
-  //     new session starts with a fresh window
-  //   - reconnectInFlight gate in fireReconnect prevents the checker
-  //     from triggering a second reconnect while one is already running
-  //     (fast belt-and-suspenders alongside the lastHeartbeatMs reset
-  //     done inside the checker on fire)
+  //   - lastHeartbeatMs reset only on the Reconnect path so a dismissed
+  //     prompt leaves session state intact
+  //   - reconnectInFlight + promptInFlight gates in fireReconnect prevent
+  //     duplicate toasts and concurrent reconnect cycles when both
+  //     watchdog sources fire on the same disconnect
   // Tuning constants HEARTBEAT_TIMEOUT_MS / HEARTBEAT_CHECK_INTERVAL_MS
   // imported from constants.ts.
+  //
+  // hasEverStreamed (0.1.4) flips true on the SECOND heartbeat (~4s of
+  // iframe liveness) — single first-heartbeat is too eager because the
+  // iframe's setInterval can fire before the WebRTC peer attaches.
+  // Used by fireReconnect to differentiate cold-start failure ("Stream
+  // failed to start. Retry?") from mid-stream disconnect ("Stream
+  // disconnected. Reconnect?"). Reset alongside hasReceivedFirstHeartbeat
+  // when starting a new checker or completing a reconnect.
   let lastHeartbeatMs = Date.now();
   let hasReceivedFirstHeartbeat = false;
+  let heartbeatCount = 0;
+  let hasEverStreamed = false;
   let heartbeatChecker: NodeJS.Timeout | null = null;
 
   /**
-   * Single reconnect entry point. Both the log-watchdog (PHASE THREE)
-   * and the heartbeat detector (PHASE FOUR) call this — `reconnectInFlight`
-   * makes it safe to invoke from multiple sources without double-firing.
-   * Circuit breaker, intent-snapshot guard, and programmaticReconnect
-   * handling all live here so callers stay simple.
+   * Single disconnect-detected entry point. Both the log-watchdog
+   * (PHASE THREE) and the heartbeat detector (PHASE FOUR) call this.
+   *
+   * 0.1.4 behavior: NEVER auto-reconnects. Surfaces a non-modal toast
+   * with [Reconnect] / [Disconnect] and waits for the user. Rationale:
+   *   - Auto-reconnect tears down the relay session, which kills any
+   *     virtual displays Vibeshine owns. Every transient blip wiped
+   *     and respawned the user's monitors.
+   *   - On cold-start failures (which are intermittent — the iframe's
+   *     WebRTC handshake races a hardcoded ~10s relay-side timeout
+   *     and sometimes loses), auto-reconnect runs the same flaky
+   *     sequence in a tight loop, locking the user out of the
+   *     manual-retry path that historically worked on the second try.
+   *
+   * The toast wording differs based on hasEverStreamed:
+   *   - false → "Stream failed to start. Retry?" (cold-start case)
+   *   - true  → "Stream disconnected. Reconnect?" (mid-stream case)
+   *
+   * If the user dismisses the toast, the session is left untouched —
+   * the status-bar still routes to COMMANDS.connect for manual retry.
    */
   async function fireReconnect(reason: string): Promise<void> {
     if (reconnectInFlight) {
-      output.appendLine(`[Reconnect:${reason}] already in flight — skipping`);
+      output.appendLine(`[Reconnect:${reason}] reconnect already in flight — skipping`);
+      return;
+    }
+    if (promptInFlight) {
+      output.appendLine(`[Reconnect:${reason}] prompt already shown — skipping duplicate`);
       return;
     }
 
-    // Circuit breaker check BEFORE we change any state. If the user has
-    // already burned through RECONNECT_LIMIT attempts in
-    // RECONNECT_WINDOW_MS, the root cause is persistent and we should
-    // stop fighting it. Surface a warning so the user knows what happened.
-    const now = Date.now();
-    while (
-      reconnectTimestamps.length > 0 &&
-      reconnectTimestamps[0] < now - RECONNECT_WINDOW_MS
-    ) {
-      reconnectTimestamps.shift();
-    }
-    if (reconnectTimestamps.length >= RECONNECT_LIMIT) {
-      output.appendLine(
-        `[Reconnect:${reason}] circuit-breaker: ${RECONNECT_LIMIT} reconnects in ${RECONNECT_WINDOW_MS}ms — giving up`,
-      );
-      vscode.window.showWarningMessage(
-        'Moo Capture: stream keeps dropping. Auto-reconnect disabled. Reconnect manually after fixing the cause.',
-      );
-      return;
-    }
-    reconnectTimestamps.push(now);
+    const message = hasEverStreamed
+      ? `Moo Capture: stream disconnected (${reason}). Reconnect?`
+      : `Moo Capture: stream failed to start (${reason}). Retry?`;
 
-    // Visible feedback so the user understands the brief flicker.
-    vscode.window.setStatusBarMessage(
-      `$(sync~spin) Moo Capture: auto-reconnecting (${reason})…`,
-      4000,
-    );
+    // Update status bar so the user has a second route back to a
+    // working stream even if they dismiss the toast.
+    statusBar.text = STATE_LABELS.disconnected;
+    statusBar.tooltip = 'Stream disconnected — click to reconnect';
 
-    reconnectInFlight = true;
-    programmaticReconnect = true;
+    output.appendLine(`[Reconnect:${reason}] prompting user (hasEverStreamed=${hasEverStreamed})`);
+    promptInFlight = true;
     try {
-      await vscode.commands.executeCommand(COMMANDS.disconnect);
-      // Snapshot the intent timestamp set by our own disconnect. Any
-      // later update during the settle means a NEW intentional disconnect
-      // happened — honour that intent and abort.
-      const ownDisconnectMs = lastIntentionalDisconnectMs;
-      await new Promise((r) => setTimeout(r, 1500));
-      if (lastIntentionalDisconnectMs !== ownDisconnectMs) {
-        output.appendLine(
-          `[Reconnect:${reason}] aborted — intent changed during 1.5s settle`,
-        );
-        return;
+      const choice = await vscode.window.showInformationMessage(
+        message,
+        'Reconnect',
+        'Disconnect',
+      );
+
+      if (choice === 'Reconnect') {
+        reconnectInFlight = true;
+        programmaticReconnect = true;
+        try {
+          await vscode.commands.executeCommand(COMMANDS.disconnect);
+          // Snapshot the intent timestamp set by our own disconnect.
+          // Any later update during the settle means a NEW intentional
+          // disconnect happened — honour that intent and abort.
+          const ownDisconnectMs = lastIntentionalDisconnectMs;
+          await new Promise((r) => setTimeout(r, 1500));
+          if (lastIntentionalDisconnectMs !== ownDisconnectMs) {
+            output.appendLine(
+              `[Reconnect:${reason}] aborted — intent changed during 1.5s settle`,
+            );
+            return;
+          }
+          await vscode.commands.executeCommand(COMMANDS.connect);
+        } finally {
+          programmaticReconnect = false;
+          reconnectInFlight = false;
+          // Reset heartbeat clock AND cold-start gates so the new
+          // session has a fresh window AND can't trip the timeout
+          // before the new iframe sends its first heartbeat.
+          lastHeartbeatMs = Date.now();
+          hasReceivedFirstHeartbeat = false;
+          heartbeatCount = 0;
+          hasEverStreamed = false;
+        }
+      } else if (choice === 'Disconnect') {
+        output.appendLine(`[Reconnect:${reason}] user chose Disconnect`);
+        await vscode.commands.executeCommand(COMMANDS.disconnect);
+      } else {
+        // Toast dismissed (X or timeout). Leave session as-is — virtual
+        // displays survive, status bar already routes to manual reconnect.
+        output.appendLine(`[Reconnect:${reason}] user dismissed prompt — leaving session as-is`);
       }
-      await vscode.commands.executeCommand(COMMANDS.connect);
     } finally {
-      programmaticReconnect = false;
-      reconnectInFlight = false;
-      // Reset heartbeat clock AND the cold-start gate so the new
-      // session has a fresh window AND can't trip the timeout before
-      // the new iframe has a chance to send its first heartbeat.
-      lastHeartbeatMs = Date.now();
-      hasReceivedFirstHeartbeat = false;
+      promptInFlight = false;
     }
   }
 
@@ -497,10 +518,27 @@ export function activate(context: vscode.ExtensionContext): void {
   let connectInProgress = false;
   context.subscriptions.push(
     vscode.commands.registerCommand(COMMANDS.connect, async () => {
-      // Guard: prevent concurrent connect flows
-      if (connectInProgress || connManager.currentState !== 'disconnected') {
-        output.appendLine('[Connect] Ignoring duplicate connect request.');
+      // Guard: prevent CONCURRENT connect flows (real in-flight only).
+      //
+      // 0.1.5: dropped the `currentState !== 'disconnected'` check.
+      // The iframe can fail (e.g. WebRTC ICE timeout) WITHOUT throwing
+      // in connManager.connect() — the connect-side promise resolved
+      // successfully with port/hostId/apps, then the iframe died on
+      // its own. State stays at 'streaming' from the extension's
+      // perspective even though no frames are flowing. The old guard
+      // refused EVERY subsequent retry as "duplicate connect request",
+      // locking the user out of recovery without reloading Cursor.
+      // Now we only block on a genuine in-flight connect.
+      if (connectInProgress) {
+        output.appendLine('[Connect] Ignoring duplicate connect request (in-flight).');
         return;
+      }
+      // If state is anything other than 'disconnected', force a quick
+      // teardown first so we start from a clean slate. disconnect() is
+      // synchronous and idempotent — safe to call from any state.
+      if (connManager.currentState !== 'disconnected') {
+        output.appendLine(`[Connect] Forcing teardown from stuck state '${connManager.currentState}' before reconnect`);
+        connManager.disconnect();
       }
       connectInProgress = true;
 
@@ -619,6 +657,8 @@ export function activate(context: vscode.ExtensionContext): void {
         // registered with context.subscriptions for deactivate.
         lastHeartbeatMs = Date.now();
         hasReceivedFirstHeartbeat = false;
+        heartbeatCount = 0;
+        hasEverStreamed = false;
         if (heartbeatChecker) { clearInterval(heartbeatChecker); }
         heartbeatChecker = setInterval(() => {
           if (!panel || !panel.visible) { return; }
@@ -673,9 +713,17 @@ export function activate(context: vscode.ExtensionContext): void {
         context.subscriptions.push(
           panel.webview.onDidReceiveMessage((msg: { command?: string; type?: string; appId?: number; appName?: string; muted?: boolean }) => {
             if (msg.command === 'launchApp' && msg.appId !== undefined) {
-              const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${msg.appId}`;
               const mlSettings = buildMlSettings(getConfig());
-              output.appendLine(`[Connect] Launching ${msg.appName}: ${streamUrl} settings=${JSON.stringify(mlSettings)}`);
+              // 0.1.6: encode mlSettings as a base64-JSON query param so
+              // the iframe loads stream.html DIRECTLY — no bootstrap →
+              // load → redirect dance. moo-mute.js (already loaded in
+              // stream.html's <head> before stream.js parses) decodes
+              // the param and seeds localStorage.mlSettings for the
+              // relay's getLocalStreamSettings(). Saves ~600-900ms of
+              // cold-start vs the previous two-iframe-load pattern.
+              const settingsParam = Buffer.from(JSON.stringify(mlSettings)).toString('base64');
+              const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${msg.appId}&mlSettings=${encodeURIComponent(settingsParam)}`;
+              output.appendLine(`[Connect] Launching ${msg.appName} settings=${JSON.stringify(mlSettings)}`);
               if (panel) {
                 panel.webview.html = getWebviewContent(streamUrl, port, hostId, apps, mlSettings);
               }
@@ -684,6 +732,13 @@ export function activate(context: vscode.ExtensionContext): void {
             } else if (msg.type === 'moo-heartbeat') {
               lastHeartbeatMs = Date.now();
               hasReceivedFirstHeartbeat = true;
+              heartbeatCount++;
+              // After the second heartbeat (~4s of iframe liveness) we
+              // treat the stream as having actually started — strongly
+              // implies the WebRTC peer attached and frames are flowing.
+              // Used by fireReconnect to distinguish cold-start failure
+              // from mid-stream disconnect.
+              if (heartbeatCount >= 2) { hasEverStreamed = true; }
             }
           }),
         );
@@ -729,7 +784,12 @@ export function activate(context: vscode.ExtensionContext): void {
       );
       if (!choice) { return; }
 
-      connManager.dispose();
+      // 0.1.7: graceful path awaits cancelStream + 500ms settle BEFORE
+      // killing the relay so Sunshine actually receives the cancel. The
+      // old `connManager.dispose()` was sync and killed the relay
+      // mid-flight, leaving an orphan session that collided with the
+      // next connect (`[active sessions: 2]` → 555ms disconnect).
+      await connManager.gracefulDispose();
       if (panel) {
         panel.dispose();
         panel = undefined;
@@ -1161,12 +1221,13 @@ function getWebviewContent(
   const appsJson = JSON.stringify(apps || []).replace(/</g, '\\u003c');
   const mlSettingsJson = JSON.stringify(mlSettings ?? null).replace(/</g, '\\u003c');
   const isStreaming = streamUrl !== '';
-  // Two-phase load: bootstrap navigates to the relay's index.html (same
-  // origin as stream.html). When that load fires we write our preset into
-  // localStorage.mlSettings, then redirect the iframe to streamUrl. The
-  // relay's stream.js reads localStorage on construction, so the settings
-  // must be present before stream.html parses.
-  const bootstrapUrl = (isStreaming && port) ? `http://127.0.0.1:${port}/index.html` : '';
+  // 0.1.6: single-phase load. mlSettings is encoded in streamUrl's
+  // ?mlSettings= query param; moo-mute.js (loaded in stream.html's
+  // <head> before stream.js parses) decodes it and seeds
+  // localStorage.mlSettings before getLocalStreamSettings() runs.
+  // Replaces the previous bootstrap → load → redirect pattern that
+  // loaded /index.html first only to get same-origin localStorage write
+  // access. Saves ~600-900ms of cold-start.
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1190,12 +1251,6 @@ function getWebviewContent(
     }
     iframe.view-only {
       pointer-events: none;
-    }
-    /* Bootstrap-phase hide: the iframe briefly visits the relay's index
-       page to seed localStorage with our preset before the real stream
-       URL loads. Hide it so users don't see the flash. */
-    iframe.bootstrap {
-      visibility: hidden;
     }
     #exit-overlay {
       display: flex;
@@ -1324,8 +1379,7 @@ function getWebviewContent(
 
   ${isStreaming ? `<iframe
     id="streamFrame"
-    class="bootstrap"
-    src="${bootstrapUrl}"
+    src="${streamUrl}"
     allow="autoplay; fullscreen; microphone; gamepad; camera; display-capture; pointer-lock; keyboard-map; clipboard-read; clipboard-write"
     allowfullscreen
   ></iframe>` : ''}
@@ -1627,43 +1681,14 @@ function getWebviewContent(
             // cross-origin — cannot patch
           }
         }
-        // Two-phase load. First load lands on the relay's index.html
-        // (bootstrap, same origin as stream.html); we use that as a
-        // toehold to write localStorage.mlSettings, then redirect the
-        // iframe to the actual stream URL. Second load is the stream
-        // itself — patchIframe runs there. Phase flag is per-iframe
-        // closure; if the user re-launches an app, the whole webview
-        // HTML is rebuilt and this script re-evaluates fresh.
-        let streamPhase = mlSettings ? 'bootstrap' : 'stream';
-        if (!mlSettings) {
-          // No settings to apply — go straight to stream URL on the
-          // first load. (Only happens on the launcher view where
-          // streamUrl is empty anyway, so this branch is defensive.)
-          if (currentStreamUrl) { iframe.src = currentStreamUrl; }
-        }
+        // 0.1.6: single-phase load. iframe.src is set in the HTML
+        // attribute directly to streamUrl (with mlSettings encoded in
+        // ?mlSettings= URL param). moo-mute.js (loaded in stream.html
+        // <head> before stream.js parses) decodes the param and seeds
+        // localStorage.mlSettings. The previous bootstrap →
+        // localStorage write → src-redirect dance is gone — replaced
+        // by one HTTP load that already has everything it needs.
         iframe.addEventListener('load', function() {
-          if (streamPhase === 'bootstrap') {
-            try {
-              const win = iframe.contentWindow;
-              if (win && win.localStorage) {
-                let existing = {};
-                try {
-                  const raw = win.localStorage.getItem('mlSettings');
-                  if (raw) { existing = JSON.parse(raw); }
-                } catch (_) { /* corrupt or missing — start fresh */ }
-                const merged = Object.assign({}, existing, mlSettings);
-                win.localStorage.setItem('mlSettings', JSON.stringify(merged));
-              }
-            } catch (e) {
-              // Same-origin DOM/storage access can fail in some webview
-              // configurations. Stream still loads with whatever the
-              // relay had previously saved.
-            }
-            streamPhase = 'stream';
-            iframe.classList.remove('bootstrap');
-            iframe.src = currentStreamUrl;
-            return;
-          }
           patchIframe();
         });
       }
