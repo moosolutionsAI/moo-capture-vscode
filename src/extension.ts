@@ -11,6 +11,36 @@ import type { MooCaptureConfig, ConnectionState } from './types';
 // Config helper
 // ---------------------------------------------------------------------------
 
+/**
+ * Map our MooCaptureConfig values into the localStorage shape the relay
+ * (moonlight-web-stream) reads when stream.html boots. Keys are documented
+ * in .relay/package/static/default_settings.js. We only override the
+ * latency-relevant subset; everything else falls through to relay defaults.
+ *
+ * codec mapping: VS Code config exposes 'h264' | 'hevc'; relay expects
+ * 'h264' | 'h265' | 'av1' | 'auto'. 'hevc' becomes 'h265'.
+ */
+interface MlStreamSettings {
+  bitrate: number;
+  fps: number;
+  videoSize: 'custom';
+  videoSizeCustom: { width: number; height: number };
+  videoCodec: 'h264' | 'h265';
+}
+
+function buildMlSettings(cfg: MooCaptureConfig): MlStreamSettings {
+  const match = /^(\d+)x(\d+)$/.exec(cfg.resolution);
+  const width = match ? Number(match[1]) : 1920;
+  const height = match ? Number(match[2]) : 1080;
+  return {
+    bitrate: cfg.bitrate,
+    fps: cfg.fps,
+    videoSize: 'custom',
+    videoSizeCustom: { width, height },
+    videoCodec: cfg.codec === 'hevc' ? 'h265' : 'h264',
+  };
+}
+
 function getConfig(): MooCaptureConfig {
   const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
   // Moonlight applies a "remote IPv4 streaming" 1024-byte MTU cap when the
@@ -181,6 +211,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const connManager = new ConnectionManager(output, context.globalStorageUri.fsPath);
   let panel: vscode.WebviewPanel | undefined;
+  // Set during a known disconnect+reconnect transition (e.g. preset apply)
+  // so the panel.onDidDispose handler skips its interactive Keep / Stop /
+  // Shutdown modal. Cleared by the path that set it.
+  let programmaticReconnect = false;
 
   // Status bar
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, STATUS_BAR_PRIORITY);
@@ -341,6 +375,17 @@ export function activate(context: vscode.ExtensionContext): void {
         // reference is ever lost without dispose firing.
         context.subscriptions.push(
           panel.onDidDispose(async () => {
+            // Programmatic reconnect: skip the user-facing modal — we're
+            // tearing the panel down deliberately to apply new settings.
+            // The triggering path (e.g. tuneStream) is responsible for
+            // creating a new panel via the connect command.
+            if (programmaticReconnect) {
+              connManager.disconnect();
+              statusBar.text = STATE_LABELS.disconnected;
+              statusBar.tooltip = 'Reconnecting with new settings...';
+              panel = undefined;
+              return;
+            }
             // Prompt the user for what to do on tab close
             const choice = await vscode.window.showInformationMessage(
               'Moo Capture tab closed. What would you like to do?',
@@ -409,9 +454,10 @@ export function activate(context: vscode.ExtensionContext): void {
           panel.webview.onDidReceiveMessage((msg: { command?: string; type?: string; appId?: number; appName?: string; muted?: boolean }) => {
             if (msg.command === 'launchApp' && msg.appId !== undefined) {
               const streamUrl = `http://127.0.0.1:${port}/stream.html?hostId=${hostId}&appId=${msg.appId}`;
-              output.appendLine(`[Connect] Launching ${msg.appName}: ${streamUrl}`);
+              const mlSettings = buildMlSettings(getConfig());
+              output.appendLine(`[Connect] Launching ${msg.appName}: ${streamUrl} settings=${JSON.stringify(mlSettings)}`);
               if (panel) {
-                panel.webview.html = getWebviewContent(streamUrl, port, hostId, apps);
+                panel.webview.html = getWebviewContent(streamUrl, port, hostId, apps, mlSettings);
               }
             } else if (msg.type === 'moo-mute' && typeof msg.muted === 'boolean') {
               connManager.notifyMuteState(msg.muted);
@@ -691,21 +737,30 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const presetName = choice.label.replace(/^\$\([^)]+\)\s*/, '');
 
-      // If currently streaming, the preset values do not take effect until
-      // the next connect. Prompt the user explicitly — never auto-reconnect.
-      // Disconnect leaves the relay running so the next connect is fast.
+      // If currently streaming, the preset values only land on the next
+      // connect. Click on Reconnect IS consent — bypass the panel-dispose
+      // modal via programmaticReconnect, then re-run connect to land on
+      // the launcher with the new settings applied. User picks the app
+      // again from the launcher (one click, no second modal).
       if (connManager.currentState === 'streaming') {
         const action = await vscode.window.showWarningMessage(
-          `Moo Capture: ${presetName} preset saved. The new settings only apply on the next connect. Reconnect now?`,
+          `Moo Capture: ${presetName} preset saved. Reconnect now to apply?`,
           { modal: true },
           'Reconnect',
           'Later',
         );
         if (action === 'Reconnect') {
-          await vscode.commands.executeCommand(COMMANDS.disconnect);
-          // User initiates the new connect themselves to keep the action
-          // explicit — we never auto-fire connect here. The disconnect path
-          // already updates the status bar to "Ready, click to reconnect".
+          programmaticReconnect = true;
+          try {
+            await vscode.commands.executeCommand(COMMANDS.disconnect);
+            // Brief settle so the relay tears down the prior session
+            // before connect reads /api/hosts. Without it, the SSE guard
+            // can briefly observe sessions=1 from the dying session.
+            await new Promise((r) => setTimeout(r, 300));
+            await vscode.commands.executeCommand(COMMANDS.connect);
+          } finally {
+            programmaticReconnect = false;
+          }
         }
         return;
       }
@@ -829,9 +884,17 @@ function getWebviewContent(
   port?: number,
   hostId?: number,
   apps?: Array<{ id: number; name: string }>,
+  mlSettings?: MlStreamSettings,
 ): string {
   const appsJson = JSON.stringify(apps || []).replace(/</g, '\\u003c');
+  const mlSettingsJson = JSON.stringify(mlSettings ?? null).replace(/</g, '\\u003c');
   const isStreaming = streamUrl !== '';
+  // Two-phase load: bootstrap navigates to the relay's index.html (same
+  // origin as stream.html). When that load fires we write our preset into
+  // localStorage.mlSettings, then redirect the iframe to streamUrl. The
+  // relay's stream.js reads localStorage on construction, so the settings
+  // must be present before stream.html parses.
+  const bootstrapUrl = (isStreaming && port) ? `http://127.0.0.1:${port}/index.html` : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -855,6 +918,12 @@ function getWebviewContent(
     }
     iframe.view-only {
       pointer-events: none;
+    }
+    /* Bootstrap-phase hide: the iframe briefly visits the relay's index
+       page to seed localStorage with our preset before the real stream
+       URL loads. Hide it so users don't see the flash. */
+    iframe.bootstrap {
+      visibility: hidden;
     }
     #exit-overlay {
       display: flex;
@@ -983,7 +1052,8 @@ function getWebviewContent(
 
   ${isStreaming ? `<iframe
     id="streamFrame"
-    src="${streamUrl}"
+    class="bootstrap"
+    src="${bootstrapUrl}"
     allow="autoplay; fullscreen; microphone; gamepad; camera; display-capture; pointer-lock; keyboard-map; clipboard-read; clipboard-write"
     allowfullscreen
   ></iframe>` : ''}
@@ -993,6 +1063,7 @@ function getWebviewContent(
       const vscode = acquireVsCodeApi();
       const apps = ${appsJson};
       const currentStreamUrl = '${streamUrl}';
+      const mlSettings = ${mlSettingsJson};
       const port = ${port || 0};
       const hostId = ${hostId || 0};
 
@@ -1278,7 +1349,45 @@ function getWebviewContent(
             // cross-origin — cannot patch
           }
         }
-        iframe.addEventListener('load', patchIframe);
+        // Two-phase load. First load lands on the relay's index.html
+        // (bootstrap, same origin as stream.html); we use that as a
+        // toehold to write localStorage.mlSettings, then redirect the
+        // iframe to the actual stream URL. Second load is the stream
+        // itself — patchIframe runs there. Phase flag is per-iframe
+        // closure; if the user re-launches an app, the whole webview
+        // HTML is rebuilt and this script re-evaluates fresh.
+        let streamPhase = mlSettings ? 'bootstrap' : 'stream';
+        if (!mlSettings) {
+          // No settings to apply — go straight to stream URL on the
+          // first load. (Only happens on the launcher view where
+          // streamUrl is empty anyway, so this branch is defensive.)
+          if (currentStreamUrl) { iframe.src = currentStreamUrl; }
+        }
+        iframe.addEventListener('load', function() {
+          if (streamPhase === 'bootstrap') {
+            try {
+              const win = iframe.contentWindow;
+              if (win && win.localStorage) {
+                let existing = {};
+                try {
+                  const raw = win.localStorage.getItem('mlSettings');
+                  if (raw) { existing = JSON.parse(raw); }
+                } catch (_) { /* corrupt or missing — start fresh */ }
+                const merged = Object.assign({}, existing, mlSettings);
+                win.localStorage.setItem('mlSettings', JSON.stringify(merged));
+              }
+            } catch (e) {
+              // Same-origin DOM/storage access can fail in some webview
+              // configurations. Stream still loads with whatever the
+              // relay had previously saved.
+            }
+            streamPhase = 'stream';
+            iframe.classList.remove('bootstrap');
+            iframe.src = currentStreamUrl;
+            return;
+          }
+          patchIframe();
+        });
       }
     })();
   </script>
