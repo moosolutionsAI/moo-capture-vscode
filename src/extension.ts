@@ -1011,28 +1011,38 @@ export function activate(context: vscode.ExtensionContext): void {
       if (tuneStreamBusy) { return; }
       tuneStreamBusy = true;
       try {
-      type PresetId = 'esports' | 'game' | 'video' | 'custom';
+      type PresetId = 'smooth' | 'game' | 'video' | 'custom';
       interface Preset extends vscode.QuickPickItem {
         id: PresetId;
       }
+      // 0.1.8: Esports (720p120) replaced with Smooth (1080p120). Esports
+      // forced 720p→1080p upscale in Cursor's webview on common 1080p
+      // monitors, which softens text and reads as "laggy" even though
+      // pipeline latency is identical. Smooth matches the typical
+      // physical panel pixel-for-pixel and refresh-for-refresh, which
+      // is the single biggest perceptual-latency win on this hardware.
+      // Game/Video bitrates also tightened — Game's 30Mbps for 1080p60
+      // desktop was past the visually-transparent ceiling; Video
+      // converted to lower bitrate that still matches H.264 quality
+      // because HEVC compresses ~1.5× better.
       const items: Preset[] = [
         {
-          id: 'esports',
-          label: '$(zap) Esports Mode',
-          description: 'h264 / 120 fps / 15000 Kbps / 1280x720',
-          detail: 'Aggressive low latency. Tekken, fighters, FPS, rhythm games.',
+          id: 'smooth',
+          label: '$(zap) Smooth Mode',
+          description: 'h264 / 120 fps / 30000 Kbps / 1920x1080',
+          detail: 'Native panel match for 1080p 120Hz monitors. Smoothest motion, sharpest text — recommended default.',
         },
         {
           id: 'game',
           label: '$(rocket) Game Mode',
-          description: 'h264 / 60 fps / 30000 Kbps / 1920x1080',
-          detail: 'Balanced. Action games, single-player, RPGs.',
+          description: 'h264 / 60 fps / 25000 Kbps / 1920x1080',
+          detail: 'Lower power. Same resolution, half the framerate. Use on battery or for static reading.',
         },
         {
           id: 'video',
           label: '$(device-camera-video) Video Mode',
-          description: 'hevc / 60 fps / 25000 Kbps / 2560x1440',
-          detail: 'Highest fidelity. Watching streams, video, desktop content.',
+          description: 'hevc / 60 fps / 18000 Kbps / 2560x1440',
+          detail: 'Super-sampled fidelity. Best for video playback and dense content; uses HEVC.',
         },
         {
           id: 'custom',
@@ -1051,20 +1061,20 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
       const target = vscode.ConfigurationTarget.Global;
-      if (choice.id === 'esports') {
+      if (choice.id === 'smooth') {
         await cfg.update('codec', 'h264', target);
         await cfg.update('fps', 120, target);
-        await cfg.update('bitrate', 15000, target);
-        await cfg.update('resolution', '1280x720', target);
+        await cfg.update('bitrate', 30000, target);
+        await cfg.update('resolution', '1920x1080', target);
       } else if (choice.id === 'game') {
         await cfg.update('codec', 'h264', target);
         await cfg.update('fps', 60, target);
-        await cfg.update('bitrate', 30000, target);
+        await cfg.update('bitrate', 25000, target);
         await cfg.update('resolution', '1920x1080', target);
       } else if (choice.id === 'video') {
         await cfg.update('codec', 'hevc', target);
         await cfg.update('fps', 60, target);
-        await cfg.update('bitrate', 25000, target);
+        await cfg.update('bitrate', 18000, target);
         await cfg.update('resolution', '2560x1440', target);
       }
       const presetName = choice.label.replace(/^\$\([^)]+\)\s*/, '');
