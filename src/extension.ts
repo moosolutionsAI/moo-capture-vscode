@@ -223,7 +223,34 @@ function checkVibeshineReachable(host: string, port: number, output: vscode.Outp
 // ---------------------------------------------------------------------------
 
 export function activate(context: vscode.ExtensionContext): void {
-  const output = vscode.window.createOutputChannel('Moo Capture');
+  // Output channel behind a line-cap wrapper. Relay stdout/stderr is piped
+  // in line-by-line (relayManager), so a relay stuck in a restart or
+  // reconnect loop grows the channel without bound over a long session.
+  // Past OUTPUT_MAX_LINES the channel is cleared and a marker line notes
+  // the reset. clear()/replace() reset the counter so external callers
+  // stay consistent with what's actually on screen.
+  const rawOutput = vscode.window.createOutputChannel('Moo Capture');
+  const OUTPUT_MAX_LINES = 20000;
+  let outputLineCount = 0;
+  const output: vscode.OutputChannel = {
+    get name() { return rawOutput.name; },
+    append: (value: string) => rawOutput.append(value),
+    appendLine: (value: string) => {
+      if (outputLineCount >= OUTPUT_MAX_LINES) {
+        rawOutput.clear();
+        outputLineCount = 0;
+        rawOutput.appendLine(`[Output] log cleared after ${OUTPUT_MAX_LINES} lines (session cap)`);
+      }
+      outputLineCount++;
+      rawOutput.appendLine(value);
+    },
+    replace: (value: string) => { outputLineCount = 0; rawOutput.replace(value); },
+    clear: () => { outputLineCount = 0; rawOutput.clear(); },
+    show: (columnOrPreserveFocus?: unknown, preserveFocus?: boolean) =>
+      (rawOutput.show as (a?: unknown, b?: boolean) => void)(columnOrPreserveFocus, preserveFocus),
+    hide: () => rawOutput.hide(),
+    dispose: () => rawOutput.dispose(),
+  };
   output.appendLine('Moo Capture: activate()');
 
   // Ensure globalStoragePath exists
@@ -234,6 +261,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const connManager = new ConnectionManager(output, context.globalStorageUri.fsPath);
   let panel: vscode.WebviewPanel | undefined;
+  // Single-slot disposables for the stream panel's listeners (statsCleanup
+  // pattern). The connect command is deliberately re-entrant while a panel
+  // exists (0.1.5 dropped the state guard so users can retry a dead
+  // iframe), so per-connect registration without a slot stacked duplicate
+  // webview message handlers: each launchApp then reloaded the iframe N
+  // times (racing sessions — same class as the 0.1.7 `[active sessions:
+  // 2]` collision) and every heartbeat was counted N times, defeating the
+  // hasEverStreamed second-heartbeat gate.
+  let panelMessageListener: vscode.Disposable | null = null;
+  let panelDisposeListener: vscode.Disposable | null = null;
   // Set during a known disconnect+reconnect transition (e.g. preset apply)
   // so the panel.onDidDispose handler skips its interactive Keep Relay /
   // Shut Down modal. Cleared by the path that set it.
@@ -547,6 +584,13 @@ export function activate(context: vscode.ExtensionContext): void {
       // Pre-flight: check if Vibeshine is reachable
       const vibeshineOk = await checkVibeshineReachable(config.sunshineHost, config.sunshinePort, output);
       if (!vibeshineOk) {
+        // CRITICAL: release the in-flight guard BEFORE this early return.
+        // This path exits without ever reaching the finally at the bottom
+        // of the connect flow, so leaving the flag set locked out every
+        // subsequent connect (including the Retry button below, whose
+        // recursive executeCommand was silently swallowed by the guard)
+        // until the extension host reloaded.
+        connectInProgress = false;
         const action = await vscode.window.showErrorMessage(
           'Vibeshine is not responding. Is the Vibeshine Service running?',
           'Retry',
@@ -590,12 +634,12 @@ export function activate(context: vscode.ExtensionContext): void {
           },
         );
 
-        // Capture the Disposable so the listener is also tied to the
-        // extension lifetime. Auto-cleaned with panel.dispose(), but pushing
-        // to context.subscriptions prevents subtle leaks if the panel
-        // reference is ever lost without dispose firing.
-        context.subscriptions.push(
-          panel.onDidDispose(async () => {
+        // Single-slot registration (see panelDisposeListener declaration).
+        // Auto-cleaned with panel.dispose(); the slot is also released at
+        // extension deactivate via context.subscriptions so the listener
+        // cannot leak if the panel reference is lost without dispose firing.
+        panelDisposeListener?.dispose();
+        panelDisposeListener = panel.onDidDispose(async () => {
             // CRITICAL: dispose synchronously BEFORE awaiting the modal.
             // The 2026-05-09 16:27 collision was caused by Cursor reload
             // tearing down the extension host while this handler was
@@ -608,6 +652,9 @@ export function activate(context: vscode.ExtensionContext): void {
             watchdogHandle?.noteUserDisconnect();
             // Stop the heartbeat checker — the iframe is gone.
             if (heartbeatChecker) { clearInterval(heartbeatChecker); heartbeatChecker = null; }
+            // Free the webview message listener — its webview is disposed
+            // with the panel, so the handler can never fire again.
+            if (panelMessageListener) { panelMessageListener.dispose(); panelMessageListener = null; }
             connManager.disconnect();
 
             // Programmatic reconnect: skip the user-facing modal — we're
@@ -639,8 +686,7 @@ export function activate(context: vscode.ExtensionContext): void {
               statusBar.tooltip = 'Relay running. Click to reconnect instantly.';
             }
             panel = undefined;
-          }),
-        );
+        });
 
         // Show loading state while relay starts up
         panel.webview.html = getLoadingHtml();
@@ -707,11 +753,12 @@ export function activate(context: vscode.ExtensionContext): void {
         panel.webview.html = getWebviewContent('', port, hostId, apps);
 
         // Listen for app selection and mute-state updates from the webview.
-        // Captured Disposable goes to context.subscriptions so the listener
-        // is freed at extension deactivate even if the panel disposal is
-        // missed for any reason.
-        context.subscriptions.push(
-          panel.webview.onDidReceiveMessage((msg: { command?: string; type?: string; appId?: number; appName?: string; muted?: boolean }) => {
+        // Single-slot registration (see panelMessageListener declaration):
+        // reconnecting into an EXISTING panel used to stack a second live
+        // handler here on every connect. Freed on panel dispose and at
+        // extension deactivate.
+        panelMessageListener?.dispose();
+        panelMessageListener = panel.webview.onDidReceiveMessage((msg: { command?: string; type?: string; appId?: number; appName?: string; muted?: boolean }) => {
             if (msg.command === 'launchApp' && msg.appId !== undefined) {
               const mlSettings = buildMlSettings(getConfig());
               // 0.1.6: encode mlSettings as a base64-JSON query param so
@@ -740,8 +787,7 @@ export function activate(context: vscode.ExtensionContext): void {
               // from mid-stream disconnect.
               if (heartbeatCount >= 2) { hasEverStreamed = true; }
             }
-          }),
-        );
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         output.appendLine(`[Connect] Failed: ${msg}`);
@@ -985,6 +1031,16 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({
     dispose: () => {
       if (heartbeatChecker) { clearInterval(heartbeatChecker); heartbeatChecker = null; }
+    },
+  });
+  // Panel listener slots teardown — the slots replaced the old per-connect
+  // context.subscriptions.push registrations (which accumulated duplicate
+  // live handlers across reconnects into an existing panel). This entry
+  // restores the deactivate-time guarantee those pushes used to provide.
+  context.subscriptions.push({
+    dispose: () => {
+      if (panelMessageListener) { panelMessageListener.dispose(); panelMessageListener = null; }
+      if (panelDisposeListener) { panelDisposeListener.dispose(); panelDisposeListener = null; }
     },
   });
 

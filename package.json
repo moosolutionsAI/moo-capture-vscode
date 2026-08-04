@@ -2,7 +2,7 @@
   "name": "moo-capture",
   "displayName": "Moo Capture",
   "description": "Low-latency game streaming client for VS Code — connects to Vibeshine for GPU-accelerated screen capture",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "publisher": "MooKeyboardAI",
   "license": "MIT",
   "repository": {
